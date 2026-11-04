@@ -15,6 +15,8 @@ from enum import Enum
 from openjiuwen_protocol.message import ReqMethod
 
 GATEWAY_REQ_METHODS: tuple[tuple[str, str], ...] = (
+    ("MODE_SET", "mode.set"),
+    ("MODE_GET", "mode.get"),
     ("FILE_READ_UPLOAD_CHUNK", "file.read_upload_chunk"),
     ("WORKSPACE_TREE", "workspace.tree"),
     ("WORKSPACE_PREVIEW", "workspace.preview"),
