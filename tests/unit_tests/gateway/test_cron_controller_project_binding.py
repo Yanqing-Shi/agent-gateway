@@ -449,7 +449,7 @@ async def test_create_job_without_marker_allows_default_project_and_no_fields() 
         },
         internal_proactive_sync=True,
     )
-    assert job["project_id"] == ""
+    assert job["project_id"] == "default"
     assert job["work_mode"] == "work"
 
     job_default = await cc.create_job(

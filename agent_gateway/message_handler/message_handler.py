@@ -92,6 +92,8 @@ from agent_gateway.runtime.session_input import (
     validate_session_input,
 )
 
+from agent_gateway.channel_manager.persistent_events import FeishuInboundEvent, InboundDisposition
+
 logger = logging.getLogger(__name__)
 
 _DIAGNOSIS_PUSH_EVENTS = frozenset({"trajectory.diagnosis.progress", "trajectory.diagnosis.status"})
@@ -386,6 +388,7 @@ class MessageHandler(ABC):
         self._robot_messages: asyncio.Queue["Message"] = asyncio.Queue()
         self._running = False
         self._forward_task: asyncio.Task | None = None
+        self._scheduler_stream_ids: set[str] = set()
         self._stream_tasks: dict[str, asyncio.Task] = {}  # request_id -> task
         self._stream_channels: dict[str, str] = {}  # request_id -> channel_id
         self._stream_sessions: dict[str, str | None] = {}  # request_id -> session_id
@@ -534,6 +537,244 @@ class MessageHandler(ABC):
             and is_evolution_approval_payload(payload)
             and not is_interrupt_evolution_approval_answer_payload(payload)
         )
+
+    def set_thinking_notice_handler(self, handler: Any | None) -> None:
+        self._thinking_notice_handler = handler
+
+    def set_result_delivery_handler(self, handler: Any | None) -> None:
+        """Inject the Gateway's exact-app JM-09 delivery route."""
+        self._result_delivery_handler = handler
+
+    def set_feishu_group_handler(self, handler: Any | None) -> None:
+        self._feishu_group_handler = handler
+
+    async def handle_persistent_feishu_event(
+        self, event: FeishuInboundEvent
+    ) -> InboundDisposition:
+        """Hand a bound Feishu event to AgentServer before personal message handling."""
+        if not isinstance(event, FeishuInboundEvent) or not (
+            isinstance(event.expected_agent_id, str) and event.expected_agent_id.strip()
+        ):
+            return InboundDisposition.UNCLAIMED
+
+        from uuid import uuid4
+
+        from openjiuwen_protocol.e2a.models import E2AEnvelope
+        from openjiuwen_protocol.message import ReqMethod
+
+        response = await self.agent_client.send_request(
+            E2AEnvelope(
+                request_id=f"jm08_{uuid4().hex}",
+                channel="feishu",
+                user_id=event.sender_id,
+                chat_id=event.chat_id,
+                method=ReqMethod.JIUWENMATE_FEISHU_INBOUND.value,
+                params={"event": event.to_payload()},
+            )
+        )
+        payload = getattr(response, "payload", None)
+        if not getattr(response, "ok", False) or not isinstance(payload, dict):
+            return InboundDisposition.REJECTED
+        try:
+            return InboundDisposition(payload.get("disposition"))
+        except (TypeError, ValueError):
+            return InboundDisposition.REJECTED
+
+    async def handle_persistent_dingtalk_event(self, event) -> InboundDisposition:
+        """Forward a claimed DingTalk event without entering ordinary chat routing."""
+        from uuid import uuid4
+        from openjiuwen_protocol.e2a.models import E2AEnvelope
+        from openjiuwen_protocol.message import ReqMethod
+
+        response = await self.agent_client.send_request(E2AEnvelope(
+            request_id=f"jm21_{uuid4().hex}", channel="dingtalk", user_id=event.sender_staff_id,
+            chat_id=event.conversation_id, method=ReqMethod.JIUWENMATE_DINGTALK_INBOUND.value,
+            params={"event": event.to_payload()},
+        ))
+
+        payload = getattr(response, "payload", None)
+        if not getattr(response, "ok", False) or not isinstance(payload, dict):
+            return InboundDisposition.REJECTED
+        try:
+            return InboundDisposition(payload.get("disposition"))
+        except (TypeError, ValueError):
+            return InboundDisposition.REJECTED
+
+    async def handle_persistent_welink_event(self, event: dict[str, Any]) -> InboundDisposition:
+        """Hand one polled WeLink group message to the bound colleague."""
+        from uuid import uuid4
+
+        from openjiuwen_protocol.e2a.models import E2AEnvelope
+        from openjiuwen_protocol.message import ReqMethod
+        from agent_gateway.channel_manager.im_platforms.welink.facts import WelinkInboundEvent
+
+        try:
+            parsed = event if isinstance(event, WelinkInboundEvent) else WelinkInboundEvent.from_payload(event)
+        except (TypeError, ValueError):
+            return InboundDisposition.REJECTED
+        response = await self.agent_client.send_request(
+            E2AEnvelope(
+                request_id=f"welink_{uuid4().hex}",
+                channel="welink",
+                user_id=parsed.sender_id,
+                chat_id=parsed.chat_id,
+                method=ReqMethod.JIUWENMATE_WELINK_INBOUND.value,
+                params={"event": parsed.to_payload()},
+            )
+        )
+        payload = getattr(response, "payload", None)
+        if not getattr(response, "ok", False) or not isinstance(payload, dict):
+            return InboundDisposition.RETRYABLE
+        try:
+            return InboundDisposition(payload.get("disposition"))
+        except (TypeError, ValueError):
+            return InboundDisposition.RETRYABLE
+
+    async def _handle_feishu_group_push(self, payload: dict[str, Any]) -> None:
+        from openjiuwen_protocol.e2a.models import E2AEnvelope
+        from openjiuwen_protocol.message import ReqMethod
+
+        query_id = payload.get("query_id")
+        if not isinstance(query_id, str) or not query_id:
+            return
+        handler = getattr(self, "_feishu_group_handler", None)
+        result = {"status": "unknown"}
+        try:
+            if callable(handler):
+                candidate = await handler(payload)
+                statuses = {"ok", "unknown"} if payload.get("message_ids") else {"active", "left", "unknown"}
+                if isinstance(candidate, dict) and candidate.get("status") in statuses:
+                    result = candidate
+            await self.agent_client.send_request(E2AEnvelope(
+                request_id=f"jm11_{query_id}", channel="feishu", method=ReqMethod.JIUWENMATE_GROUP_RESPONSE.value,
+                params={**result, "query_id": query_id, "app_id": payload.get("app_id"),
+                        "chat_id": payload.get("chat_id")},
+            ))
+        except Exception:
+            logger.warning("[JM-11] membership response unavailable")
+
+    async def _handle_thinking_notice_push(self, payload: dict[str, Any]) -> None:
+        """Send a waiting line on the route's channel and return the platform receipt."""
+        from uuid import uuid4
+
+        from openjiuwen_protocol.e2a.models import E2AEnvelope
+        from openjiuwen_protocol.message import ReqMethod
+
+        idempotency_key = payload.get("idempotency_key")
+        channel = payload.get("channel")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            return
+        if not isinstance(channel, str) or not channel.strip():
+            return
+        handler = getattr(self, "_thinking_notice_handler", None)
+        if not callable(handler):
+            result: dict[str, Any] = {"outcome": "pending", "error_code": "CHANNEL_ROUTE_UNAVAILABLE"}
+        else:
+            try:
+                candidate = await handler(dict(payload))
+                result = candidate if isinstance(candidate, dict) else {}
+            except Exception as exc:
+                logger.warning(
+                    "[MessageHandler] thinking notice outcome unknown: key=%s error_type=%s",
+                    idempotency_key,
+                    type(exc).__name__,
+                )
+                result = {"outcome": "unknown", "error_code": "THINKING_NOTICE_ERROR"}
+        outcome = result.get("outcome")
+        if outcome not in {"delivered", "failed", "unknown", "pending"}:
+            outcome = "unknown"
+        external_message_id = result.get("external_message_id")
+        if outcome == "delivered" and not (isinstance(external_message_id, str) and external_message_id.strip()):
+            outcome = "unknown"
+        envelope = E2AEnvelope(
+            request_id=f"jm23_ack_{uuid4().hex}",
+            channel=channel,
+            method=ReqMethod.JIUWENMATE_THINKING_NOTICE_ACK.value,
+            params={
+                "idempotency_key": idempotency_key,
+                "outcome": outcome,
+                "external_message_id": external_message_id if outcome == "delivered" else None,
+                "error_code": result.get("error_code") if outcome != "delivered" else None,
+            },
+        )
+        try:
+            response = await self.agent_client.send_request(envelope)
+            if not getattr(response, "ok", False):
+                logger.warning("[MessageHandler] thinking notice ACK was not accepted: key=%s", idempotency_key)
+        except Exception as exc:
+            logger.warning(
+                "[MessageHandler] thinking notice ACK failed: key=%s error_type=%s",
+                idempotency_key,
+                type(exc).__name__,
+            )
+
+    async def _handle_result_delivery_push(self, payload: dict[str, Any]) -> None:
+        """Send a persistent result through Gateway and return its platform receipt over E2A."""
+        from uuid import uuid4
+
+        from openjiuwen_protocol.e2a.models import E2AEnvelope
+        from openjiuwen_protocol.message import ReqMethod
+
+        delivery_id = payload.get("delivery_id")
+        stage = payload.get("stage")
+        if not isinstance(delivery_id, str) or not delivery_id.strip() or stage != "send":
+            return
+
+        handler = getattr(self, "_result_delivery_handler", None)
+        if not callable(handler):
+            result: dict[str, Any] = {"outcome": "pending", "error_code": "CHANNEL_ROUTE_UNAVAILABLE"}
+        else:
+            try:
+                candidate = await handler(dict(payload))
+                result = candidate if isinstance(candidate, dict) else {}
+            except Exception as exc:  # the platform may have accepted the send before an error surfaced
+                logger.warning(
+                    "[MessageHandler] JM-09 delivery outcome unknown: delivery_id=%s error_type=%s",
+                    delivery_id,
+                    type(exc).__name__,
+                )
+                result = {"outcome": "unknown", "error_code": "GATEWAY_DELIVERY_ERROR"}
+
+        outcome = result.get("outcome")
+        if payload.get("operation") == "reconcile" and outcome == "pending":
+            outcome = "unknown"
+        if outcome not in {"delivered", "failed", "unknown", "pending"}:
+            outcome = "unknown"
+        external_message_id = result.get("external_message_id")
+        if outcome == "delivered" and not (
+            isinstance(external_message_id, str) and external_message_id.strip()
+        ):
+            outcome = "unknown"
+        ack = {
+            "delivery_id": delivery_id,
+            "stage": stage,
+            "outcome": outcome,
+            "external_message_id": external_message_id if outcome == "delivered" else None,
+            "error_code": result.get("error_code") if outcome != "delivered" else None,
+        }
+        if payload.get("operation") == "validate_handoff":
+            ack["operation"] = "validate_handoff"
+            if isinstance(result.get("handoff_target_valid"), bool):
+                ack["handoff_target_valid"] = result["handoff_target_valid"]
+        file_key = result.get("file_key")
+        if isinstance(file_key, str) and file_key.strip():
+            ack["file_key"] = file_key
+        envelope = E2AEnvelope(
+            request_id=f"jm09_ack_{uuid4().hex}",
+            channel=payload.get("channel", "feishu"),
+            method=ReqMethod.JIUWENMATE_DELIVERY_ACK.value,
+            params=ack,
+        )
+        try:
+            response = await self.agent_client.send_request(envelope)
+            if not getattr(response, "ok", False):
+                logger.warning("[MessageHandler] JM-09 ACK was not persisted: delivery_id=%s", delivery_id)
+        except Exception as exc:
+            logger.warning(
+                "[MessageHandler] JM-09 ACK request failed: delivery_id=%s error_type=%s",
+                delivery_id,
+                type(exc).__name__,
+            )
 
     @classmethod
     def get_instance(cls, agent_client: "AgentServerClient | None" = None) -> "MessageHandler":
@@ -891,6 +1132,10 @@ class MessageHandler(ABC):
 
     @classmethod
     def _should_cancel_existing_stream_before_chat_send(cls, msg: "Message") -> bool:
+        params = msg.params if isinstance(msg.params, dict) else {}
+        group_id = params.get("group_id")
+        if isinstance(group_id, str) and group_id.strip():
+            return False
         # 主动推荐消息不取消现有流式任务，避免干扰用户当前对话
         if isinstance(msg.params, dict) and msg.params.get("source") == "proactive_recommendation":
             return False
@@ -1190,6 +1435,7 @@ class MessageHandler(ABC):
 
     def _pop_stream_tracking(self, rid: str) -> None:
         """Remove all per-request stream tracking entries for *rid*."""
+        self._scheduler_stream_ids.discard(rid)
         self._stream_tasks.pop(rid, None)
         self._stream_channels.pop(rid, None)
         self._stream_sessions.pop(rid, None)
@@ -1507,6 +1753,9 @@ class MessageHandler(ABC):
                 continue
             if channel_id is not None and self._stream_channels.get(rid) != channel_id:
                 continue
+            # The scheduler settles its own consumer after the matching backend ACK.
+            if rid in self._scheduler_stream_ids:
+                continue
             if not task.done():
                 rids_cancelled.append(rid)
                 tasks_to_cancel.append(task)
@@ -1638,6 +1887,7 @@ class MessageHandler(ABC):
             await _cancel_tasks(tasks_to_cancel)
             await self._pop_stream_tracking_and_broadcast(rids_cancelled)
 
+        await self._finish_cancelled_cron_session_runs(env_interrupt, resp)
         payload = resp.payload if isinstance(resp.payload, dict) else {}
         if payload.get("event_type") == "chat.interrupt_result":
             if not publish_interrupt_result:
@@ -3525,6 +3775,40 @@ class MessageHandler(ABC):
             chunk = parse_agent_server_wire_chunk(wire)
         except Exception as e:
             logger.exception("[MessageHandler] server_push 解析失败: %s", e)
+            return
+        if (
+            isinstance(chunk.payload, dict)
+            and chunk.payload.get("event_type") == "jiuwenmate.group.inspect"
+        ):
+            # Feishu membership and message reads can take seconds. They must not
+            # hold the ordered push lock, or the next colleague's check times out.
+            tasks = getattr(self, "_feishu_group_inspect_tasks", None)
+            if tasks is None:
+                tasks = self._feishu_group_inspect_tasks = set()
+            task = asyncio.create_task(self._handle_feishu_group_push(chunk.payload))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+            return
+        if (
+            isinstance(chunk.payload, dict)
+            and chunk.payload.get("event_type") == "jiuwenmate.thinking_notice"
+        ):
+            await self._handle_thinking_notice_push(chunk.payload)
+            return
+        if (
+            isinstance(chunk.payload, dict)
+            and chunk.payload.get("event_type") == "jiuwenmate.delivery.send"
+        ):
+            if isinstance(chunk.payload.get("file"), dict):
+                # An upload may take minutes; it must not hold the ordered push lock.
+                tasks = getattr(self, "_result_delivery_tasks", None)
+                if tasks is None:
+                    tasks = self._result_delivery_tasks = set()
+                task = asyncio.create_task(self._handle_result_delivery_push(chunk.payload))
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+            else:
+                await self._handle_result_delivery_push(chunk.payload)
             return
         rid = str(chunk.request_id or "")
         if await self._handle_login_credential_refresh_push(chunk):
@@ -6160,6 +6444,7 @@ class MessageHandler(ABC):
         self._register_stream_consumer(
             env, session_id, task, metadata=metadata, app_id=app_id, emit_processing_status=True,
         )
+        self._scheduler_stream_ids.add(env.request_id)
         try:
             await self._send_processing_status(
                 env.request_id, session_id, env.channel, is_processing=True, app_id=app_id, metadata=metadata,
@@ -6295,6 +6580,31 @@ class MessageHandler(ABC):
         task.add_done_callback(self._fire_and_forget_tasks.discard)
         return task
 
+    async def _finish_cancelled_cron_session_runs(
+        self, env: "E2AEnvelope", response: "AgentResponse",
+    ) -> None:
+        """Settle cron waiters only after a successful, session-wide cancel ACK."""
+        params = env.params if isinstance(env.params, dict) else {}
+        if str(params.get("intent", "cancel")).strip().lower() != "cancel":
+            return
+        if any(params.get(key) for key in ("target_request_id", "target_team_id", "organization_owner_stop", "organization_stop")):
+            return
+        payload = response.payload if isinstance(response.payload, dict) else {}
+        if not response.ok or payload.get("success") is not True:
+            return
+        controller = getattr(self, "_cron_controller", None)
+        finish_runs = getattr(controller, "finish_cancelled_session_runs", None)
+        session_id = str(getattr(env, "session_id", None) or "").strip()
+        if not callable(finish_runs) or not session_id:
+            return
+        try:
+            await finish_runs(session_id, user_id=getattr(env, "user_id", None))
+        except Exception:
+            logger.warning(
+                "[MessageHandler] cancelled cron waiter cleanup failed: session_id=%s",
+                session_id, exc_info=True,
+            )
+
     async def _send_interrupt_to_agent(
         self,
         env: "E2AEnvelope",
@@ -6318,6 +6628,7 @@ class MessageHandler(ABC):
                 "[MessageHandler] AgentServer 中断响应: request_id=%s ok=%s",
                 resp.request_id, resp.ok,
             )
+            await self._finish_cancelled_cron_session_runs(env, resp)
             payload = resp.payload if isinstance(resp.payload, dict) else {}
             ch = (channel_id or getattr(env, "channel", None) or "").strip()
             sid = (session_id or getattr(env, "session_id", None) or "").strip()

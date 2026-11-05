@@ -403,12 +403,69 @@ class _DummyBus:
         pass
 
 
+# Public JiuwenMate operations handled by AgentServer. Credential binding and
+# colleague deletion have local Gateway handlers. Internal IM methods stay private.
+_JIUWENMATE_FORWARD_METHODS = frozenset({
+    "jiuwenmate.activity.get",
+    "jiuwenmate.agent_mail.auth.begin",
+    "jiuwenmate.agent_mail.auth.cancel",
+    "jiuwenmate.agent_mail.auth.poll",
+    "jiuwenmate.agent_mail.disconnect",
+    "jiuwenmate.agent_mail.status",
+    "jiuwenmate.channel.list",
+    "jiuwenmate.channel.messages",
+    "jiuwenmate.channel.trace",
+    "jiuwenmate.chat.history",
+    "jiuwenmate.chat.send",
+    "jiuwenmate.colleague.create",
+    "jiuwenmate.colleague.ensure_default",
+    "jiuwenmate.colleague.get",
+    "jiuwenmate.colleague.list",
+    "jiuwenmate.colleague.publish",
+    "jiuwenmate.colleague.set_enabled",
+    "jiuwenmate.colleague.settings.get",
+    "jiuwenmate.colleague.settings.update",
+    "jiuwenmate.conversation.delete",
+    "jiuwenmate.conversation.list",
+    "jiuwenmate.conversation.pin",
+    "jiuwenmate.conversation.rename",
+    "jiuwenmate.dingtalk_auth.begin",
+    "jiuwenmate.dingtalk_auth.cancel",
+    "jiuwenmate.dingtalk_auth.disconnect",
+    "jiuwenmate.dingtalk_auth.poll",
+    "jiuwenmate.dingtalk_auth.status",
+    "jiuwenmate.knowledge.list",
+    "jiuwenmate.models.list",
+    "jiuwenmate.permission.decide",
+    "jiuwenmate.request.abort",
+    "jiuwenmate.request.get",
+    "jiuwenmate.schedule.create",
+    "jiuwenmate.schedule.delete",
+    "jiuwenmate.schedule.history",
+    "jiuwenmate.schedule.list",
+    "jiuwenmate.schedule.run",
+    "jiuwenmate.schedule.set_enabled",
+    "jiuwenmate.schedule.update",
+    "jiuwenmate.sharing.decide",
+    "jiuwenmate.sharing.list",
+    "jiuwenmate.sharing.revoke",
+    "jiuwenmate.welink_office.connect",
+    "jiuwenmate.welink_office.disconnect",
+    "jiuwenmate.welink_office.status",
+})
+
 # 仅转发到 Agent 的 Web method
 _FORWARD_REQ_METHODS = frozenset({
+    *_JIUWENMATE_FORWARD_METHODS,
     'group.create',
     'group.delete',
     'group.get',
     'group.history.get',
+    "group.execution.list",
+    "group.execution.get",
+    "group.file.rename",
+    "group.file.delete",
+    "group.history.clear",
     'group.list',
     'group.member.add',
     'group.update',
@@ -631,10 +688,16 @@ _FORWARD_REQ_METHODS = frozenset({
 })
 
 _FORWARD_NO_LOCAL_HANDLER_METHODS = frozenset({
+    *_JIUWENMATE_FORWARD_METHODS,
     'group.create',
     'group.delete',
     'group.get',
     'group.history.get',
+    "group.execution.list",
+    "group.execution.get",
+    "group.file.rename",
+    "group.file.delete",
+    "group.history.clear",
     'group.list',
     'group.member.add',
     'group.update',
@@ -3028,6 +3091,22 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
 
         from agent_gateway.routing.e2a_proxy import proxy_unary_request
 
+        target = str((params or {}).get("session_id") or session_id or "").strip()
+
+        def project_activity(ok, payload):
+            if not ok or not isinstance(payload, dict):
+                return
+            busy = payload.get("is_processing")
+            if not isinstance(busy, bool):
+                busy = channel.is_session_busy(target)
+            cron_activity = getattr(_get_cron(), "is_session_processing", None)
+            if callable(cron_activity):
+                busy = busy or cron_activity(target, user_id=user_id)
+            if payload.get("organization_owner_stopped") is True:
+                busy = False
+            payload["is_processing"] = busy
+            payload["status"] = "processing" if busy else "idle"
+
         await proxy_unary_request(
             channel=channel,
             agent_client=_resolve(agent_client),
@@ -3038,6 +3117,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             user_id=user_id,
             req_method=ReqMethod.SESSION_GET_METADATA,
             label="session.get_metadata",
+            on_done=project_activity,
         )
 
     async def _session_message_continue_queued(ws, req_id, params, session_id, user_id=None):
@@ -4420,31 +4500,8 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             )
             return
         try:
-            # 多应用模式：params 必须含 apps 键
-            apps = params["apps"]
-            app_names = [a.get("name", "?") for a in apps]
-            logger.debug(
-                "[channel.feishu.set_conf] req_id=%s, apps=%d, names=%s",
-                req_id, len(apps), app_names,
-            )
-            # 先归一化（用 _FEISHU_APP_DEFAULTS 补充前端未发送的字段），再持久化
-            normalized_apps = _normalize_feishu_conf({"apps": apps})["apps"]
-            # 从 cm 读取已有 apps，按 app_id 合并保留未发送的敏感字段
-            existing_feishu = cm.get_conf("feishu")
-            existing_apps = existing_feishu.get("apps", []) if isinstance(existing_feishu, dict) else []
-            merged_apps = _merge_apps_by_id(normalized_apps, existing_apps)
-            await cm.set_conf("feishu", {"apps": merged_apps})
-            should_clear_agent_config_cache = False
-            try:
-                replace_channel_subsection_with_cleanup("feishu", "apps", merged_apps, {"apps", "send_file_allowed"})
-                should_clear_agent_config_cache = True
-            except Exception as e:  # noqa: BLE001
-                logger.warning("[channel.feishu.set_conf] 写回 config.yaml apps 失败: %s", e)
-            try:
-                await channel.send_response(ws, req_id, ok=True, payload={"config": {"apps": merged_apps}})
-            finally:
-                if should_clear_agent_config_cache:
-                    _schedule_clear_agent_config_cache("channel.feishu.set_conf")
+            saved = await save_persistent_apps(cm, "feishu", params)
+            await channel.send_response(ws, req_id, ok=True, payload={"config": saved})
         except Exception as e:  # noqa: BLE001
             logger.exception("[channel.feishu.set_conf] 异常, req_id=%s: %s", req_id, e)
             await channel.send_response(ws, req_id, ok=False, error=str(e), code="INTERNAL_ERROR")
@@ -4618,6 +4675,10 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             )
             return
         try:
+            if "apps" in params:
+                saved = await save_persistent_apps(cm, "dingtalk", params)
+                await channel.send_response(ws, req_id, ok=True, payload={"config": saved})
+                return
             await cm.set_conf("dingtalk", params)
             conf = cm.get_conf("dingtalk")
             should_clear_agent_config_cache = False
@@ -4631,6 +4692,8 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             finally:
                 if should_clear_agent_config_cache:
                     _schedule_clear_agent_config_cache("channel.dingtalk.set_conf")
+        except ValueError as e:
+            await channel.send_response(ws, req_id, ok=False, error=str(e), code="BAD_REQUEST")
         except Exception as e:  # noqa: BLE001
             logger.exception("[channel.dingtalk.set_conf] %s", e)
             await channel.send_response(ws, req_id, ok=False, error=str(e), code="INTERNAL_ERROR")
@@ -5644,6 +5707,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     _register_config_proxy("config.set", _ConfigReq.CONFIG_SET, _config_set)
     _register_config_proxy("config.save_all", _ConfigReq.CONFIG_SAVE_ALL, _config_save_all)
     _register_config_proxy("config.validate_model", _ConfigReq.CONFIG_VALIDATE_MODEL, _config_validate_model)
+    _register_config_proxy("models.refresh_status", _ConfigReq.MODELS_REFRESH_STATUS)
     _register_config_proxy("models.list", _ConfigReq.MODELS_LIST, _models_list)
     _register_config_proxy("models.get", _ConfigReq.MODELS_GET,
                            lambda ws, rid, p, sid: _model_resource_rpc(ws, rid, p, sid, "models.get"))
@@ -5846,6 +5910,12 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     # Deprecated aliases for clients upgrading from the pre-split probe API.
     channel.register_method("heartbeat.get_conf", _health_check_get_conf)
     channel.register_method("heartbeat.set_conf", _health_check_set_conf)
+    from agent_gateway.channel_manager.web.persistent_bindings import register_persistent_bindings
+
+    save_persistent_apps = register_persistent_bindings(
+        channel, lambda: _resolve(channel_manager), lambda: _resolve(agent_client),
+        _normalize_feishu_conf, _schedule_clear_agent_config_cache,
+    )
     channel.register_method("channel.feishu.get_conf", _channel_feishu_get_conf)
     channel.register_method("channel.feishu.set_conf", _channel_feishu_set_conf)
     channel.register_method("channel.xiaoyi.get_conf", _channel_xiaoyi_get_conf)

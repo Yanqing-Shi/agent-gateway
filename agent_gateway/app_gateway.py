@@ -2168,7 +2168,10 @@ async def _run(
     # Start with no applied integration config, then install each entry
     # independently below.  This prevents one bad optional channel from
     # suppressing every later channel or terminating the Gateway.
+    from agent_gateway.channel_manager.persistent_output import resolve_output_file
+
     channel_manager = ChannelManager(message_handler, config={})
+    channel_manager.set_persistent_output_file_resolver(resolve_output_file)
     # 回填引用：MessageHandler 实例化早于 ChannelManager，广播全局事件时需经它取 web channel。
     message_handler.set_channel_manager(channel_manager)
 
@@ -2294,6 +2297,13 @@ async def _run(
                 },
             )
 
+            def persistent_models_unapplied(response: Any) -> bool:
+                payload = getattr(response, "payload", None)
+                if isinstance(payload, dict) and payload.get("code") == "PERSISTENT_MODELS_NOT_APPLIED":
+                    logger.warning("[App] worker could not apply persistent models: %s", payload.get("error"))
+                    return True
+                return False
+
             reload_ok = False
             last_error: Exception | None = None
             runtime_failed_reject = False
@@ -2304,6 +2314,8 @@ async def _run(
                         reload_ok = True
                         break
                     err_payload = getattr(reload_resp, "payload", None) or {}
+                    if persistent_models_unapplied(reload_resp):
+                        return False
                     err_msg = (
                         err_payload.get("error")
                         if isinstance(err_payload, dict)
@@ -2341,6 +2353,8 @@ async def _run(
                         if getattr(reload_resp, "ok", False):
                             reload_ok = True
                             break
+                        if persistent_models_unapplied(reload_resp):
+                            return False
                     except Exception as e:  # noqa: BLE001
                         last_error = e
                 if reload_ok:
@@ -2722,8 +2736,6 @@ async def _run(
     feishu_enterprise_tasks: dict[str, asyncio.Task] = {}
     xiaoyi_channel = None
     xiaoyi_task = None
-    dingtalk_channel = None
-    dingtalk_task = None
     telegram_channel = None
     telegram_task = None
     discord_channel = None
@@ -2764,7 +2776,7 @@ async def _run(
             return False
         return old_channel_conf != new_channel_conf
 
-    async def _stop_channel(channel, task, channel_name: str, background_wait: bool = False) -> None:
+    async def _stop_channel(channel, task, channel_name: str, background_wait: bool = False, *, unregister: bool = True) -> None:
         if task is not None:
             task.cancel()
             if background_wait:
@@ -2806,7 +2818,8 @@ async def _run(
                 logger.warning("[App] timeout while stopping %sChannel", channel_name.capitalize())
             except Exception as e:  # noqa: BLE001
                 logger.warning("[App] failed to stop previous %sChannel: %s", channel_name.capitalize(), e)
-            channel_manager.unregister_channel(channel.channel_id)
+            if unregister:
+                channel_manager.unregister_channel(channel.channel_id)
 
     def _is_channel_enabled(conf: dict | None, required_fields: list[str]) -> tuple[bool, str]:
         if conf is None:
@@ -2817,9 +2830,33 @@ async def _run(
             return all_fields_present, f"missing {','.join(required_fields)}" if not all_fields_present else ""
         return bool(enabled_raw), "enabled = false" if not enabled_raw else ""
 
+    def _create_dingtalk_channel(settings: dict):
+        from agent_gateway.channel_manager.im_platforms.dingtalk.dingtalk_connect import (
+            DingTalkChannel,
+            DingTalkConfig,
+        )
+
+        return DingTalkChannel(DingTalkConfig.model_validate(settings), _DummyBus())
+
+    async def _stop_dingtalk_channel(channel) -> None:
+        # Already taken out of the registry; unregistering by channel id would drop newer instances.
+        await _stop_channel(
+            channel, getattr(channel, "start_task", None), "dingtalk", background_wait=True, unregister=False,
+        )
+
+    from agent_gateway.channel_manager.im_platforms.dingtalk.lifecycle import DingTalkChannelSet
+
+    dingtalk_channels = DingTalkChannelSet(
+        channel_manager,
+        create_channel=_create_dingtalk_channel,
+        stop_channel=_stop_dingtalk_channel,
+        api_base=_DINGTALK_DEFAULT_API_BASE,
+        oapi_base=_DINGTALK_DEFAULT_OAPI_BASE,
+    )
+
     async def _apply_channel_config(conf: dict) -> None:
         nonlocal feishu_channel, feishu_task, xiaoyi_channel, xiaoyi_task
-        nonlocal dingtalk_channel, dingtalk_task, telegram_channel, telegram_task
+        nonlocal telegram_channel, telegram_task
         nonlocal discord_channel, discord_task
         nonlocal slack_channel, slack_task
         nonlocal whatsapp_channel, whatsapp_task
@@ -2846,6 +2883,7 @@ async def _run(
             "feishu_enterprise",
             "xiaoyi",
             "dingtalk",
+            "welink",
             "telegram",
             "whatsapp",
             "discord",
@@ -2898,12 +2936,15 @@ async def _run(
                         continue
 
                     app_id = str(app.get("app_id") or "").strip()
+                    persistent_agent_id = str(app.get("persistent_agent_id") or "").strip()
                     channel_id = "feishu"
 
                     feishu_config = FeishuConfig(
                         enabled=True,
                         app_id=app_id,
                         app_secret=str(app.get("app_secret") or "").strip(),
+                        agent_id=persistent_agent_id,
+                        bot_open_id=str(app.get("bot_open_id") or "").strip() if persistent_agent_id else "",
                         encrypt_key=str(app.get("encrypt_key") or "").strip(),
                         verification_token=str(app.get("verification_token") or "").strip(),
                         allow_from=app.get("allow_from") or [],
@@ -2982,11 +3023,14 @@ async def _run(
 
                     bot_key = bot_key.strip()
                     app_id = str(bot_conf.get("app_id") or "").strip()
+                    persistent_agent_id = str(bot_conf.get("persistent_agent_id") or "").strip()
                     channel_id = f"feishu_enterprise:{app_id}"
                     feishu_config = FeishuConfig(
                         enabled=True,
                         app_id=app_id,
                         app_secret=str(bot_conf.get("app_secret") or "").strip(),
+                        agent_id=persistent_agent_id,
+                        bot_open_id=str(bot_conf.get("bot_open_id") or "").strip() if persistent_agent_id else "",
                         encrypt_key=str(bot_conf.get("encrypt_key") or "").strip(),
                         verification_token=str(bot_conf.get("verification_token") or "").strip(),
                         allow_from=bot_conf.get("allow_from") or [],
@@ -3086,34 +3130,23 @@ async def _run(
                     channel.start_task = task  # 挂到 channel 对象上，不另存 dict
                     logger.info("[App] XiaoyiChannel(api_id=%s) from channels.xiaoyi.apps", api_id or "default")
 
-        if "dingtalk" in changed_channels:
-            dingtalk_conf = conf.get("dingtalk") if isinstance(conf, dict) else None
-            await _stop_channel(dingtalk_channel, dingtalk_task, "dingtalk", background_wait=True)
-            dingtalk_channel, dingtalk_task = None, None
+        if "welink" in changed_channels:
+            from agent_gateway.channel_manager.im_platforms.welink.welink_runtime import WelinkRuntime
 
-            if isinstance(dingtalk_conf, dict):
-                enabled, reason = _is_channel_enabled(dingtalk_conf, ["client_id", "client_secret"])
-                if not enabled:
-                    logger.info("[App] channels.dingtalk.%s, DingTalkChannel disabled", reason)
-                else:
-                    from agent_gateway.channel_manager.im_platforms.dingtalk.dingtalk_connect import (
-                        DingTalkChannel,
-                        DingTalkConfig,
-                    )
-                    dingtalk_config = DingTalkConfig(
-                        enabled=True,
-                        client_id=str(dingtalk_conf.get("client_id") or "").strip(),
-                        client_secret=str(dingtalk_conf.get("client_secret") or "").strip(),
-                        allow_from=dingtalk_conf.get("allow_from") or [],
-                        api_base=str(dingtalk_conf.get("api_base") or "").strip() or _DINGTALK_DEFAULT_API_BASE,
-                        oapi_base=str(dingtalk_conf.get("oapi_base") or "").strip() or _DINGTALK_DEFAULT_OAPI_BASE,
-                    )
-                    dingtalk_channel = DingTalkChannel(dingtalk_config, _DummyBus())
-                    channel_manager.register_channel(dingtalk_channel)
-                    dingtalk_task = asyncio.create_task(dingtalk_channel.start(), name="dingtalk")
-                    logger.info("[App] DingTalkChannel registered from config.yaml.channels.dingtalk")
-            else:
-                logger.info("[App] channels.dingtalk missing or invalid, DingTalkChannel disabled")
+            runtime = getattr(channel_manager, "_welink_runtime", None)
+            if runtime is None:
+                runtime = WelinkRuntime(channel_manager, _DummyBus(), message_handler.handle_persistent_welink_event)
+                channel_manager._welink_runtime = runtime
+            try:
+                await runtime.apply(conf.get("welink") or {})
+            except Exception:
+                channel_manager.mark_channel_restart_pending("welink")
+                raise
+
+        if "dingtalk" in changed_channels:
+            # Restarts are serialized and always read the latest DingTalk settings.
+            for app_id in await dingtalk_channels.restart():
+                logger.info("[App] DingTalkChannel registered: app_id=%s", app_id)
 
         if "telegram" in changed_channels:
             telegram_conf = conf.get("telegram") if isinstance(conf, dict) else None
@@ -3783,7 +3816,10 @@ async def _run(
                 pass
             await xiaoyi_channel.stop()
         # ---- 从 channel_manager 清理所有动态注册的 channel 实例 ----
-        for _cid in ("feishu", "xiaoyi"):
+        runtime = getattr(channel_manager, "_welink_runtime", None)
+        if runtime is not None:
+            await runtime.stop()
+        for _cid in ("feishu", "xiaoyi", "dingtalk"):
             for ch in channel_manager.pop_channels_by_id(_cid):
                 task = getattr(ch, "start_task", None)
                 if task is not None:
@@ -3794,13 +3830,6 @@ async def _run(
                         pass
                 await ch.stop()
         # -----------------------------------
-        if dingtalk_channel is not None and dingtalk_task is not None:
-            dingtalk_task.cancel()
-            try:
-                await dingtalk_task
-            except (TypeError, asyncio.CancelledError):
-                pass
-            await dingtalk_channel.stop()
         if telegram_channel is not None and telegram_task is not None:
             telegram_task.cancel()
             try:

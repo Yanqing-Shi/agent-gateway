@@ -32,6 +32,19 @@ from agent_gateway.routing.agent_client import WebSocketAgentServerClient
 from agent_gateway.routing.keys import AgentRef, RoutingKey
 
 
+@pytest.fixture
+def channel_store(monkeypatch):
+    saved = {}
+
+    async def edit_body(channel_id, edit):
+        saved[channel_id] = edit(saved.get(channel_id, {}))
+        return saved[channel_id]
+
+    from agent_gateway.channel_manager.web import persistent_bindings
+    monkeypatch.setattr(persistent_bindings, "edit_channel_body", edit_body)
+    return saved
+
+
 class FakeWebChannel:
     def __init__(self):
         self.channel_id = "web"
@@ -43,7 +56,7 @@ class FakeWebChannel:
         self.rebounds: list[tuple[str | None, str]] = []
         self.cleared: list[str | None] = []
 
-    def register_method(self, name, handler):
+    def register_method(self, name, handler, *, local_only=False):
         self.methods[name] = handler
 
     def on_connect(self, handler):
@@ -1333,7 +1346,7 @@ async def test_openai_account_logout_wins_against_inflight_poll(
         ("heartbeat.set_conf", {"every": 30, "target": "web"}),
     ],
 )
-async def test_config_save_handlers_respond_before_agent_reload_finishes(monkeypatch, method, params):
+async def test_config_save_handlers_respond_before_agent_reload_finishes(monkeypatch, method, params, channel_store):
     agent_client = FakeReloadAgentClient()
     channel_manager = FakeChannelManager()
     heartbeat_service = FakeHeartbeatService()
@@ -1342,11 +1355,6 @@ async def test_config_save_handlers_respond_before_agent_reload_finishes(monkeyp
         app_web_handlers,
         "update_channel_in_config",
         lambda channel_id, conf: persisted.append((channel_id, dict(conf))),
-    )
-    monkeypatch.setattr(
-        app_web_handlers,
-        "replace_channel_subsection_with_cleanup",
-        lambda channel_id, subsection, conf, keep_keys: persisted.append((channel_id, conf)),
     )
     monkeypatch.setattr(
         app_web_handlers,
@@ -1361,7 +1369,7 @@ async def test_config_save_handlers_respond_before_agent_reload_finishes(monkeyp
     task = asyncio.create_task(channel.methods[method](object(), "req-save", params, "sess-1"))
     try:
         await asyncio.wait_for(agent_client.reload_started.wait(), timeout=0.5)
-        assert persisted
+        assert channel_store.get("feishu") if method == "channel.feishu.set_conf" else persisted
         assert channel.responses[-1]["id"] == "req-save"
         assert channel.responses[-1]["ok"] is True
     finally:
@@ -2275,14 +2283,8 @@ async def test_channel_xiaoyi_get_conf_empty_returns_default_apps(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_channel_feishu_set_conf_apps_mode(monkeypatch):
+async def test_channel_feishu_set_conf_apps_mode(channel_store):
     cm = FakeChannelManager()
-    recorded_subsection: list[tuple] = []
-    monkeypatch.setattr(
-        app_web_handlers,
-        "replace_channel_subsection_with_cleanup",
-        lambda cid, sub, conf, keep_keys: recorded_subsection.append((cid, sub, conf, keep_keys)),
-    )
     channel = _bind(channel_manager=cm)
     apps_payload = [
         {
@@ -2297,10 +2299,7 @@ async def test_channel_feishu_set_conf_apps_mode(monkeypatch):
     await channel.methods["channel.feishu.set_conf"](
         object(), "req-apps", {"apps": apps_payload}, "sess-1"
     )
-    assert len(recorded_subsection) == 1
-    assert recorded_subsection[0][0] == "feishu"
-    assert recorded_subsection[0][1] == "apps"
-    written_apps = recorded_subsection[0][2]
+    written_apps = channel_store["feishu"]["apps"]
     assert len(written_apps) == 2
     assert written_apps[0]["name"] == "应用A"
     assert written_apps[0]["app_id"] == "cli_a"
@@ -2353,17 +2352,11 @@ async def test_channel_xiaoyi_set_conf_apps_mode(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_channel_feishu_set_conf_apps_empty_list(monkeypatch):
+async def test_channel_feishu_set_conf_apps_empty_list(channel_store):
     cm = FakeChannelManager()
-    recorded_subsection: list[tuple] = []
-    monkeypatch.setattr(
-        app_web_handlers,
-        "replace_channel_subsection_with_cleanup",
-        lambda cid, sub, conf, keep_keys: recorded_subsection.append((cid, sub, conf, keep_keys)),
-    )
     channel = _bind(channel_manager=cm)
     await channel.methods["channel.feishu.set_conf"](object(), "req-empty", {"apps": []}, "sess-1")
-    assert recorded_subsection[0][2] == []
+    assert channel_store["feishu"]["apps"] == []
     assert channel.responses[-1]["ok"] is True
     assert channel.responses[-1]["payload"]["config"]["apps"] == []
 

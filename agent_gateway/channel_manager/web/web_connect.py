@@ -19,8 +19,8 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
-from urllib.parse import parse_qs, urlparse
 from weakref import WeakKeyDictionary
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 from openjiuwen_protocol.message import EventType, Message, Mode, ReqMethod
@@ -124,6 +124,8 @@ _WEB_FULL_PAYLOAD_EVENT_TYPES = frozenset(
         "chat.tool_result",
         "client.attachments_changed",
         "chat.processing_status",
+        "chat.moa_status",
+        "jiuwenmate.chat.stream",
         "chat.llm_call_start",
         "chat.llm_call_end",
         "chat.interrupt_result",
@@ -239,15 +241,14 @@ class WebChannel(BaseWsChannel):
         # 供 /ws/git 写操作(如 discard_turn_changes)查询 agent 是否正在执行。
         # 未跟踪的 session 默认返回 False(不忙碌)。
         self._session_busy: dict[str, bool] = {}
+        self._session_event_listeners: list[Callable[[str, str, dict], Any]] = []
+        self._queued_moa_notices: WeakKeyDictionary[asyncio.Queue, int] = WeakKeyDictionary()
         self._expert_processing_requests: dict[str, set[tuple[str, str]]] = {}
         # session_id -> 重新绑定的 ws_id: 刷新后经新连接完成 A4P 授权
         # (complete/reject) 时登记，把该恢复 turn 的迟到事件只投给这个 ws。
         # 未登记时，原连接已断开的事件落到 session 桶，投给重连后的新连接。
         # turn 的终态事件送达后解除绑定。
         self._a4p_rebound_ws: dict[str, str] = {}
-        # Observers of per-session pushes (card shown, turn started/ended).
-        self._session_event_listeners: list[Callable[[str, str, dict], Any]] = []
-        self._queued_moa_notices: WeakKeyDictionary[asyncio.Queue, int] = WeakKeyDictionary()
         # Git diff 监控注册表(设计文档阶段10):由 app_gateway 在启动期注入,
         # handler 通过 ``getattr(channel, "git_watcher_registry", None)`` 防御性读取。
         self.git_watcher_registry: Any = None
@@ -447,8 +448,10 @@ class WebChannel(BaseWsChannel):
         if queue is not None and not getattr(ws, "closed", False):
             if self._is_moa_status_frame(data):
                 if not queue.full():
-                    data, _ = self._trace_outbound_frame(ws, data)
-                    queue.put_nowait(data)
+                    before = queue.qsize()
+                    super()._enqueue_send(ws, data)
+                    if queue.qsize() == before:
+                        return
                     self._queued_moa_notices[queue] = self._queued_moa_notices.get(queue, 0) + 1
                 return
             # Only trim optional notices under congestion; preserve every other
@@ -460,6 +463,8 @@ class WebChannel(BaseWsChannel):
                     queue.task_done()
                     if not self._is_moa_status_frame(frame):
                         retained.append(frame)
+                    elif getattr(frame, "operation", None) is not None:
+                        frame.operation.release_delivery(reason="queue_full", count=frame.pending_count)
                 for frame in retained:
                     queue.put_nowait(frame)
                 self._queued_moa_notices.pop(queue, None)
@@ -1715,18 +1720,20 @@ class WebChannel(BaseWsChannel):
             sid = payload.get("session_id") or msg.session_id
             if sid:
                 self._session_busy[sid] = bool(payload.get("is_processing", False))
-        if event_name in {"chat.processing_status", "chat.ask_user_question"} and payload is not None:
-            sid = payload.get("session_id") or msg.session_id
-            if sid:
-                for listener in list(self._session_event_listeners):
-                    try:
-                        listener(event_name, sid, payload)
-                    except Exception:
-                        logger.warning("[WebChannel] session event listener failed", exc_info=True)
-        if event_name == "chat.interrupt_result":
+        elif event_name == "chat.interrupt_result":
             intent = payload.get("intent", "cancel") if payload is not None else "cancel"
             if msg.session_id:
                 self._session_busy[msg.session_id] = intent in ("pause", "supplement", "resume")
+
+        if event_name in {"chat.processing_status", "chat.ask_user_question"} and payload is not None:
+            sid = payload.get("session_id") or msg.session_id
+            if not sid:
+                return
+            for listener in list(getattr(self, "_session_event_listeners", ())):
+                try:
+                    listener(event_name, sid, payload)
+                except Exception:
+                    logger.warning("[WebChannel] session event listener failed", exc_info=True)
 
     def add_session_event_listener(self, listener: Callable[[str, str, dict], Any]) -> None:
         """Observe ``chat.processing_status`` / ``chat.ask_user_question`` pushes per session."""
@@ -1945,7 +1952,6 @@ class WebChannel(BaseWsChannel):
                     exc_info=exc,
                 )
 
-        # Lets a server-side action replay this connection's own request path.
         setattr(ws, "_jiuwen_query", query)
         try:
             inflight: set[Any] = set()
@@ -2217,6 +2223,12 @@ class WebChannel(BaseWsChannel):
         _explicit_session_id = params.get("session_id")
         has_explicit_session = _explicit_session_id is not None and _explicit_session_id != ""
         try:
+            if method in {"chat.send", "chat.resume"} and "group_id" in params:
+                group_id = validate_session_id(params["group_id"])
+                if has_explicit_session and _explicit_session_id != group_id:
+                    raise InvalidProtocolId("group_id and session_id must match")
+                _explicit_session_id = group_id
+                has_explicit_session = True
             session_id = (
                 validate_session_id(_explicit_session_id)
                 if has_explicit_session
