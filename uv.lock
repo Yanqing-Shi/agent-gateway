@@ -57,6 +57,7 @@ dependencies = [
     { name = "dingtalk-stream" },
     { name = "discord-py" },
     { name = "fastapi" },
+    { name = "filelock" },
     { name = "httpx", extra = ["http2", "socks"] },
     { name = "imageio-ffmpeg" },
     { name = "json-repair" },
@@ -82,6 +83,7 @@ dependencies = [
     { name = "slack-bolt" },
     { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "websocket-client" },
     { name = "websockets" },
     { name = "wecom-aibot-sdk" },
 ]
@@ -122,6 +124,7 @@ requires-dist = [
     { name = "dingtalk-stream", specifier = ">=0.24.3,<0.25" },
     { name = "discord-py", specifier = ">=2.4.0,<3" },
     { name = "fastapi", specifier = ">=0.115,<1.0" },
+    { name = "filelock", specifier = ">=3.25.0,<4" },
     { name = "httpx", extras = ["http2", "socks"], specifier = ">=0.27,<1.0" },
     { name = "imageio-ffmpeg", specifier = ">=0.6,<1" },
     { name = "json-repair", specifier = ">=0.30.0,<0.60" },
@@ -129,7 +132,7 @@ requires-dist = [
     { name = "loguru", specifier = ">=0.7.3,<0.8" },
     { name = "minio", specifier = ">=7.2,<8" },
     { name = "openai", specifier = ">=1.0,<3" },
-    { name = "openjiuwen", git = "https://gitcode.com/openJiuwen/agent-core.git?rev=4dbaa84ca568af3f181da4f9cd26b713a5b73039" },
+    { name = "openjiuwen", git = "https://gitcode.com/openJiuwen/agent-core.git?rev=f3f8f576164cc405c046e43079c8ad00ee17f0c4" },
     { name = "openjiuwen-protocol", git = "https://gitcode.com/openJiuwen/agent-protocol.git?subdirectory=openjiuwen-protocol&rev=cbbadde9101db6e3d75e4ef2b9bdb6029fd92088" },
     { name = "openjiuwen-runtime-foundation", git = "https://gitcode.com/openJiuwen/agent-runtime.git?subdirectory=foundation&branch=develop" },
     { name = "opentelemetry-api", specifier = ">=1.28.0,<1.42" },
@@ -151,6 +154,7 @@ requires-dist = [
     { name = "slack-bolt", specifier = ">=1.30.0,<2" },
     { name = "starlette", specifier = ">=0.49.1,<1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.52.1,<1.0" },
+    { name = "websocket-client", specifier = ">=1.8,<2" },
     { name = "websockets", specifier = ">=12.0,<16" },
     { name = "wecom-aibot-sdk", specifier = ">=1.0.5,<2" },
 ]
@@ -3199,7 +3203,7 @@ wheels = [
 [[package]]
 name = "openjiuwen"
 version = "0.1.20"
-source = { git = "https://gitcode.com/openJiuwen/agent-core.git?rev=4dbaa84ca568af3f181da4f9cd26b713a5b73039#4dbaa84ca568af3f181da4f9cd26b713a5b73039" }
+source = { git = "https://gitcode.com/openJiuwen/agent-core.git?rev=f3f8f576164cc405c046e43079c8ad00ee17f0c4#f3f8f576164cc405c046e43079c8ad00ee17f0c4" }
 dependencies = [
     { name = "agentdescent" },
     { name = "aiofiles" },
