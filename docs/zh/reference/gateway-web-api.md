@@ -91,13 +91,13 @@ Gateway 与 AgentServer 为双进程拆分布局（架构说明见 `docs/zh/expl
 | 检查项 | 条件与默认 | 失败结果 |
 |--------|-----------|---------|
 | Origin 校验 | 仅当环境变量 `JIUWENSWARM_ENABLE_ORIGIN_CHECK=1` 开启（默认关闭）；白名单为 `JIUWENSWARM_WS_ALLOWED_ORIGIN_HOSTS`（逗号分隔 hostname，含 `none` 可放行无 Origin 客户端）（`common/security/ws_origin.py:12-41`） | HTTP 403 `Forbidden: Origin not allowed`（`web_channel_app.py:153-186`） |
-| 握手鉴权 | 由 `AgentOSRouterClient.set_handshake_auth` 注册（`extensions/agentos/agentos_router/router_client.py:548-558`），**仅 AgentOS 多用户部署启用**；token 取 URL `?token=` → `Authorization: Bearer` → `X-Token`（`extensions/agentos/auth/common.py:33-60`）；普通单用户部署不注册钩子，握手放行 | HTTP 401 `Unauthorized`（`web_channel_app.py:195-222`） |
+| 握手鉴权 | 由 `AgentOSRouterClient.set_handshake_auth` 注册（`extensions/agentos/agentos_router/router_client.py:548-558`），**仅 AgentOS 多用户部署启用**；token 取 URL `?token=` → `Authorization: Bearer` → `X-Token`（`extensions/agentos/auth/common.py:33-60`）；IAM 启用时，连接声明的 user_id（query `user_id` 与 `X-User-Id` 头，凡出现者）必须是该 token 的 IAM user_id 或 username，否则拒绝握手（`USER_MISMATCH`，与 `/file-api` 同一规则；未声明则放行）；两处各至多声明一次，重复的 query 参数或头一律拒绝（`AMBIGUOUS_USER_ID`）；普通单用户部署不注册钩子，握手放行 | HTTP 401 `Unauthorized`（`web_channel_app.py:195-222`） |
 | query `session_id` 合法性 | 若携带必须通过 `validate_session_id`（§2.3） | WS close 1008（`web_connect.py:1372-1386`） |
 | path 不匹配（非 `/ws`、`/ws/git`） | — | WS close 1008 `unsupported path`（`web_connect.py:1354-1360`） |
 
 **身份字段**（握手一次读取，整条连接复用）：
 
-- `user_id`：query `?user_id=`（用户名）优先，其次 `X-User-Id` 头（`web_connect.py:433-458`）。该值决定 RoutingKey 的 user_id 维度与多用户隔离（§3.5）；未声明时回退 `remote`（`ip:port`）。
+- `user_id`：query `?user_id=`（用户名）优先，其次 `X-User-Id` 头（`web_connect.py:433-458`）。该值由客户端声明，决定 RoutingKey 的 user_id 维度与多用户隔离（§3.5）；未声明时回退 `remote`（`ip:port`）。IAM 启用时握手已校验它属于 token（见上表“握手鉴权”），Web 连接直接使用握手记下的这个值，不再重读 query 或头；单用户部署不校验。
 - **登录会话**：`X-Auth-Session` 头优先，其次 cookie `jiuwenswarm_auth`，再次 query `?auth_session=`（鸿蒙 WebView 场景）（`web_connect.py:70-102`），仅握手读取一次。**登录态变化后前端必须重连**（前端 `webClient.reconnect`，`channels/web/frontend/src/services/webClient.ts:213-225`）。
 - IAM 认证身份（UUID）只作认证门禁，不参与工作区身份推导（用户目录按 username 布局，`web_connect.py:450-458` 注释）。
 
@@ -283,6 +283,7 @@ Gateway 与 AgentServer 为双进程拆分布局（架构说明见 `docs/zh/expl
 - **单用户部署**：无握手鉴权、无 user_id 隔离；Gateway 与 AgentServer 共享 `~/.jiuwenswarm/` 数据目录（旧基线 `session.list` 等接口在 AgentServer 离线时读本地目录的 fallback 已删除，现统一 E2A，见 §6.1）。
 - **AgentOS 多用户部署**：`AgentOSRouterClient` 按连接 user_id（username）把 E2A 请求路由到每用户独立的 AgentServer 运行时（工作区 `/home/agentos/users/<username>`，`extensions/agentos/agentos_router/router_client.py:450-462`）。**数据隔离靠"每用户一个注入目录的 AgentServer"实现**，session/project/team 数据天然只落在该用户目录。
 - **越权表现**：跨用户访问通常表现为 `NOT_FOUND`（查不到）；明确拒绝的：cron/heartbeat 归属校验 `FORBIDDEN`/`NOT_FOUND`、`/file-api` 的 `USER_MISMATCH`(403)、group 的 ownership 校验（以 `NOT_FOUND` 隐藏存在性）。
+- **声明身份与 token 绑定**：Web/TUI 连接、`/file-api` 与 web proxy 的身份都是客户端声明的 user_id（用户名）。IAM 启用时三者都要求声明值属于 token（IAM user_id 或 username），否则拒绝：WebSocket 握手 401，`/file-api` 与 web proxy 403 `USER_MISMATCH`。会话归属校验（如 `mode.set`）比较的就是这个已绑定的名字；单用户部署无 token，可声明任意名字。
 - **登录模型凭据**：`credential_ref` 与路由 user_id 是两套体系；凭据只能来自服务端登录会话（`_auth_session` 无条件覆盖客户端传值，`app_web_handlers.py:4883`）。登出时经 `auth.credentials.update` 撤销 AgentServer 侧凭据（`web_http_auth.py:140-152`）。
 
 ### 3.6 连接生命周期
@@ -1048,6 +1049,24 @@ chat.send / session.create 可携带（`common/schema/chat_send.py:219-240`）�
 | `side_conversation` | — | — | 出现即 `BAD_REQUEST` | 已废弃 |
 - **响应**：`{session_id(新), source_session_id, title, moa_enabled}`。
 - **错误**：`BAD_REQUEST` / `NOT_FOUND` / `ALREADY_EXISTS`。
+
+#### mode.set / mode.get
+
+> **网关处理**：**透传**——白名单转发，params 原样（仅 F.2 通用归一化）。与 TUI 路由共用同一 AgentServer 入口。非字符串的 `mode` 由 F.2 帧级校验在本地返回 `BAD_REQUEST`，不转发；`mode` 取值是否合法、会话是否存在均由 AgentServer 判定。
+- **用途**：已保存会话在同一 Session ID 内切换执行模式（Web 对话内切换）。只用于已保存的会话：新会话的初始模式由 `session.create` 或首条 `chat.send` 携带，未保存的草稿在客户端本地切换，不发请求。
+- **归属**：由 AgentServer 校验——会话的创建通道与用户须与请求连接一致，否则 `NOT_FOUND`；未记录归属者的会话视为匿名用户所有，只对未声明身份的调用方（单用户部署）可见。归属者只在会话创建时记录，之后的请求不会补写。归属与 `expected_mode` 在同一次提交中一起校验。网关不持有会话归属数据，只转发连接身份：通道 `web` 与客户端在握手时声明的 `user_id`，帧内 params 不能改写它。IAM 启用时握手已确认该 `user_id` 属于 token（§3.5）；单用户部署不做此确认。
+- **并发**：AgentServer 按会话串行处理 mode 请求。多个标签页基于同一 `expected_mode` 同时切换时，先到者提交，其余因当前模式已变得到 `MODE_CONFLICT`，客户端随后用 mode.get 回读。网关不排队、不去重，只把每个应答送回发起请求的连接。
+- **mode.set**：
+
+| 参数 | 类型 | 必填 | 默认/校验 | 说明 |
+|------|------|------|----------|------|
+| `session_id` | string | 是 | 须与请求会话一致 | 目标会话 |
+| `mode` | string | 是 | 三段 canonical 模式（不含 `team.design`；`team` 等旧式简写不接受）；否则 `BAD_REQUEST` | 目标模式 |
+| `expected_mode` | string | 是 | 缺失或为空 → `BAD_REQUEST`；与当前路由不一致（忽略计划态）→ `MODE_CONFLICT` | 客户端认为的当前模式 |
+
+- **mode.set 响应**：`{previous_mode, mode, work_mode, project_id, changed}`；已是目标模式时 `changed=false`，可安全重试。
+- **mode.get**：参数 `session_id`；响应 `{mode, work_mode, project_id}`，用于应答丢失后回读权威模式。
+- **错误**：`BAD_REQUEST`（参数非法、缺少 `expected_mode`、通道不支持、绑定智能体组 / 外部智能体 / 定时任务的会话）/ `NOT_FOUND`（会话不存在或不属于请求方）/ `SESSION_BUSY`（仍在执行，未提交）/ `MODE_CONFLICT` / `MODE_UNKNOWN`（仅 mode.get）。
 
 #### session.assets.list / register / rename
 
@@ -4267,7 +4286,7 @@ Gateway 注册（`lifecycle_handlers.py:164-172`）：`session.archive` / `sessi
 |---------|------|
 | 本地（纯本地逻辑） | `memory.compute`、`hooks.list`、`commands.list`、`path.*`、`updater.*`、`health_check.*`（+heartbeat 别名）、`channel.*` 配置族、`task.asr.transcribe`、`external_cli.*`、`openai_account.*`、`cron.job.*`（9 个）、`project.remove`（Gateway 编排）、`chat.send/interrupt/resume/user_answer/swarmflow_reply`（空 ack shell）、`history.get`（ack shell）、`connection.status`、`topic_starters.*`、`prompt_suggestion.*` |
 | E2A 代理（本地 handler + 转发） | `session.list/create/get_metadata/rename/pin/plan_status/message.continue_queued`、`session.selection.set`、`project.list/info/get_sessions/get_cron_sessions/create/rename/pin/restore/pinned_sessions`、`project.git.*`（11 个）、`media.persist/discard`、`document.persist/formats`、`heartbeat.job.*`（10 个，经 HeartbeatControllerProxy）、`permissions.*`（tools/rules/approval_overrides/owner_scopes）、`a4p.*`（6 个，含 authorization.pending）、`harness.*`、`rsi.*`、`designer.*`（13 个，§10.7）、`workspace.tree/preview/usage/entries.delete`、`file.import_url`、`file.upload_chunk`、`config.get/set/save_all`、`models.*`、`model_groups.*`、`vendors.*`、`channel.get`、`memory.forbidden.get/set`（分流） |
-| 白名单转发（无本地 handler） | `initialize`、`session.switch/fork`、`session.assets.list/register/rename`、`team.*`（templates.list/bindings.list/binding.create/binding.generate/session.bind/delete/snapshot/history.get/mq.publish/list）、`group.*`、`org.snapshot`、`swarmflow.pause/resume/stop`、`command.goal/btw/compact/mcp/workflows`、`chat.*`（上述空 ack 之外的转发主体）、`history.get`（数据主体）、`schedule.*`、`issue.*`、`skills.*`（40+）、`assets.publish.*`、`mcp.*`、`agents.*`、`agent_groups.*`、`agent_templates.*`、`plugins.*`、`plugin_packages.*`、`extensions.*`、`personal_context.*`、`proactive.feedback` |
+| 白名单转发（无本地 handler） | `initialize`、`session.switch/fork`、`mode.set/get`、`session.assets.list/register/rename`、`team.*`（templates.list/bindings.list/binding.create/binding.generate/session.bind/delete/snapshot/history.get/mq.publish/list）、`group.*`、`org.snapshot`、`swarmflow.pause/resume/stop`、`command.goal/btw/compact/mcp/workflows`、`chat.*`（上述空 ack 之外的转发主体）、`history.get`（数据主体）、`schedule.*`、`issue.*`、`skills.*`（40+）、`assets.publish.*`、`mcp.*`、`agents.*`、`agent_groups.*`、`agent_templates.*`、`plugins.*`、`plugin_packages.*`、`extensions.*`、`personal_context.*`、`proactive.feedback` |
 
 `/ws/git` 封闭方法集（6 个）：`project.git.diff_watch/diff_files_watch/diff_detail_watch/diff_unwatch/discard_turn_changes/redo_turn_changes`（§7.3）。
 
@@ -4794,8 +4813,8 @@ ws.addEventListener('open', async () => {
 
 | 类别 | 数量 | 方法 | 网关处理 |
 |---|---|---|---|
-| **纯透传** | 231（含下行 5 个下游未实现方法；其中 jiuwenmate.\* 46 个的服务端实现在 AgentServer `releases/0.2.9.beta2` 发布线——develop 线不含 server/jiuwenmate，契约按该发布线核对） | `_FORWARD_NO_LOCAL_HANDLER_METHODS` 全集：skills.\*、mcp.\*、agents.\*、装备包三族、plugins/extensions、personal_context.\*、a4p.\*、rsi.\*、team.\*、group.\*、org.snapshot、swarmflow.\*、command.\*、initialize、session.switch/fork、session.assets.\*、assets.publish.\*、jiuwenmate.\*、client.\*、mcp_app.\* 等 | **无**：params 逐键原样转发（仅 F.2 通用归一化）；`is_stream` 透传客户端顶层值 |
-| 网关注册、AgentServer 未实现 | 7 | group.execution.list/get、group.file.rename/delete、group.history.clear（含于纯透传 231）；client.conversations（含于纯透传）；models.refresh_status（E2A 代理） | 网关经 `protocol_compat` 注入枚举，帧级可解析、正常转发（网关侧透传已由 ST 验证）；**AgentServer 当前版本无对应成员与 handler**，南向落通用 fall-through——业务契约未定义 |
+| **纯透传** | 233（含下行 5 个下游未实现方法；其中 jiuwenmate.\* 46 个的服务端实现在 AgentServer `releases/0.2.9.beta2` 发布线——develop 线不含 server/jiuwenmate，契约按该发布线核对） | `_FORWARD_NO_LOCAL_HANDLER_METHODS` 全集：skills.\*、mcp.\*、agents.\*、装备包三族、plugins/extensions、personal_context.\*、a4p.\*、rsi.\*、team.\*、group.\*、org.snapshot、swarmflow.\*、command.\*、initialize、session.switch/fork、mode.set/get、session.assets.\*、assets.publish.\*、jiuwenmate.\*、client.\*、mcp_app.\* 等 | **无**：params 逐键原样转发（仅 F.2 通用归一化）；`is_stream` 透传客户端顶层值 |
+| 网关注册、AgentServer 未实现 | 7 | group.execution.list/get、group.file.rename/delete、group.history.clear（含于纯透传 233）；client.conversations（含于纯透传）；models.refresh_status（E2A 代理） | 网关经 `protocol_compat` 注入枚举，帧级可解析、正常转发（网关侧透传已由 ST 验证）；**AgentServer 当前版本无对应成员与 handler**，南向落通用 fall-through——业务契约未定义 |
 | 派发等同纯透传 | 13 | issue.\*（4）+ schedule.\*（9）——白名单在册但未列入 no-local 名单、无本地 handler | 无（ST 已验证 params 相等） |
 | 白名单 + 网关处理 | 6 | chat.send / chat.interrupt / chat.resume / chat.user_answer / chat.swarmflow_reply / history.get | 见 F.3 逐方法改写 |
 | E2A 代理 | 128 | session.\*、project.\*、project.git.\*、media.\*、document.\*、heartbeat.job.\*、permissions.\*、a4p.\*、harness.\*、rsi.\*、designer.\*（13）、config 面板（config.\*/models.\*/model_groups.\*）、session.selection.set、workspace.\*、file.import_url/upload_chunk 等（注册本地 handler 内构造 E2A 请求） | 见 F.4 网关侧处理点 |
@@ -5487,6 +5506,8 @@ ws.addEventListener('open', async () => {
 | `media.discard` | E2A 代理（本地 handler 构造请求） | 网关构造 E2A 请求，params 透传 |
 | `media.persist` | E2A 代理（本地 handler 构造请求） | >4MB base64 先经 E2A 分块预上传（path/_persisted 替代） |
 | `memory.compute` | 纯本地 | 网关内执行，不触达 AgentServer |
+| `mode.get` | **透传** | params 逐键原样（仅 F.2 通用归一化） |
+| `mode.set` | **透传** | params 逐键原样（仅 F.2 通用归一化） |
 
 
 **请求/返回帧**：

@@ -442,6 +442,41 @@ def _inject_session_work_mode(msg: Message) -> None:
     params["_work_mode_explicit"] = binding.has_explicit_work_mode
 
 
+def _make_inbound_forwarder(
+        channel_manager: Any,
+        forward_methods: set[str] | frozenset[str],
+        no_local_methods: set[str] | frozenset[str],
+        source_label: str,
+) -> Callable[[Message], Awaitable[bool]]:
+    """Build a channel's inbound callback that forwards whitelisted methods to MessageHandler.
+
+    The callback returns True when forwarding fully handles the request, so the
+    channel sends no local reply; False lets the channel run its local handler.
+    """
+    async def _norm_and_forward(msg: Message) -> bool:
+        method_val = getattr(getattr(msg, "req_method", None), "value", None) or ""
+        if method_val not in forward_methods:
+            return False
+        with trace_stage("preprocess.credentials"):
+            await _refresh_expired_login_credential(msg)
+        normalized = _normalize_gateway_message(msg)
+        # session.create 主路径注入 work_mode 归一化(与 fallback _session_create
+        # 共用同一 helper resolve_session_work_mode_params,保持主路径/fallback 一致):
+        # 成功时写回归一化后的 project_id/project_dir/work_mode 到 params,
+        # 转发到 AgentServer 后由其 session.create 处理逻辑使用;
+        # 失败时(非法 work_mode)不写回,保留原始 params 由 AgentServer 或
+        # fallback _session_create 返回 BAD_REQUEST。
+        if method_val == "session.create":
+            _inject_session_work_mode(normalized)
+        await channel_manager.deliver_to_message_handler(normalized)
+        logger.debug("[App] %s 入站 -> MessageHandler: id=%s channel_id=%s", source_label, msg.id, msg.channel_id)
+        if method_val in no_local_methods:
+            return True
+        return False
+
+    return _norm_and_forward
+
+
 class _InboundGatewayServer:
     """Gateway internal inbound service for forwarding channel messages to MessageHandler."""
 
@@ -2982,28 +3017,7 @@ async def _run(
             no_local_methods: set[str] | frozenset[str],
             source_label: str,
     ):
-        async def _norm_and_forward(msg: Message) -> bool:
-            method_val = getattr(getattr(msg, "req_method", None), "value", None) or ""
-            if method_val not in forward_methods:
-                return False
-            with trace_stage("preprocess.credentials"):
-                await _refresh_expired_login_credential(msg)
-            normalized = _normalize_gateway_message(msg)
-            # session.create 主路径注入 work_mode 归一化(与 fallback _session_create
-            # 共用同一 helper resolve_session_work_mode_params,保持主路径/fallback 一致):
-            # 成功时写回归一化后的 project_id/project_dir/work_mode 到 params,
-            # 转发到 AgentServer 后由其 session.create 处理逻辑使用;
-            # 失败时(非法 work_mode)不写回,保留原始 params 由 AgentServer 或
-            # fallback _session_create 返回 BAD_REQUEST。
-            if method_val == "session.create":
-                _inject_session_work_mode(normalized)
-            await channel_manager.deliver_to_message_handler(normalized)
-            logger.debug("[App] %s 入站 -> MessageHandler: id=%s channel_id=%s", source_label, msg.id, msg.channel_id)
-            if method_val in no_local_methods:
-                return True
-            return False
-
-        return _norm_and_forward
+        return _make_inbound_forwarder(channel_manager, forward_methods, no_local_methods, source_label)
 
     homepage_request_dispatched = asyncio.Event()
     web_norm_and_forward = _make_norm_and_forward(

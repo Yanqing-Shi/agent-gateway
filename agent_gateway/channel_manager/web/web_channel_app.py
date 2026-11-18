@@ -170,11 +170,13 @@ def register_http_routes(app: FastAPI, channel: WebChannel) -> None:
 async def _serve_channel_websocket(channel: WebChannel, websocket: WebSocket) -> None:
     if await _reject_disallowed_origin(websocket):
         return
-    denied, authenticated_user_id = await _reject_unauthorized_handshake(channel, websocket)
+    denied, authenticated_user_id, verified_user_id = await _reject_unauthorized_handshake(channel, websocket)
     if denied:
         return
 
-    adapter = StarletteWsAdapter(websocket, authenticated_user_id=authenticated_user_id)
+    adapter = StarletteWsAdapter(
+        websocket, authenticated_user_id=authenticated_user_id, verified_user_id=verified_user_id,
+    )
     await adapter.accept()
     try:
         await channel.handle_connection(adapter, path=adapter.path)
@@ -232,8 +234,13 @@ def _websocket_handshake_path(websocket: WebSocket) -> str:
 
 async def _reject_unauthorized_handshake(
     channel: WebChannel, websocket: WebSocket
-) -> tuple[bool, str | None]:
-    """Reject unauthorized Upgrades and retain the authenticated user identity."""
+) -> tuple[bool, str | None, str | None]:
+    """Reject unauthorized Upgrades and retain the authenticated user identity.
+
+    Returns ``(denied, authenticated_user_id, verified_user_id)``. The last is
+    the declared user the handshake bound to the token (empty when nothing was
+    declared), or None when no check ran (no hook, or IAM off).
+    """
     remote = ""
     client = getattr(websocket, "client", None)
     if client is not None:
@@ -247,9 +254,15 @@ async def _reject_unauthorized_handshake(
         channel="web",
     )
     if result is None:
-        return False, None
+        return False, None, None
     if bool(getattr(result, "success", True)):
-        return False, str(getattr(result, "user_id", "") or "").strip()
+        extensions = getattr(result, "extensions", None)
+        verified = extensions.get("connection_user_id") if isinstance(extensions, dict) else None
+        return (
+            False,
+            str(getattr(result, "user_id", "") or "").strip(),
+            verified if isinstance(verified, str) else None,
+        )
     logger.warning(
         "WebChannel 握手拒绝 path=%s reason=unauthorized",
         websocket.url.path,
@@ -257,7 +270,7 @@ async def _reject_unauthorized_handshake(
     await websocket.send_denial_response(
         PlainTextResponse(_UNAUTHORIZED_BODY, status_code=401),
     )
-    return True, None
+    return True, None, None
 
 
 def mount_future_http_router(app: FastAPI, router: Any) -> None:
