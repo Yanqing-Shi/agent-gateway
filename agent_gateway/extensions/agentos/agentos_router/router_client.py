@@ -220,6 +220,10 @@ _TEAM_MODES = frozenset({"team", "code.team", "team.plan"})
 _CONNECT_WARMUP_CHANNELS = frozenset(
     {ChannelType.WEB.value, ChannelType.CLI.value}
 )
+# Web/TUI 连接的身份是握手时声明的 user_id（query / X-User-Id）；IAM 启用时须属于该 token。
+_DECLARED_IDENTITY_CHANNELS = frozenset(
+    {ChannelType.WEB.value, ChannelType.CLI.value}
+)
 
 # create 后先 GET 等到 status=running（端口探针成功），再连 WS。
 # 探针刚过时代理仍可能 502，故保留 deadline 内重试。
@@ -771,6 +775,85 @@ class AgentOSRouterClient(AgentServerClient):
         lowered = {str(k).lower(): str(v or "") for k, v in headers.items()}
         return str(lowered.get("x-user-id", "") or "").strip()
 
+    @staticmethod
+    def _header_values(headers: Any, name: str) -> list[str]:
+        """Every value of one header, repeats included, from any header container in use."""
+        for getter in ("getlist", "get_all"):  # Starlette (Web), websockets (TUI)
+            get_values = getattr(headers, getter, None)
+            if callable(get_values):
+                return [str(value) for value in get_values(name)]
+        items = getattr(headers, "items", None)
+        if not callable(items):
+            return []
+        return [str(value) for key, value in items() if str(key).lower() == name.lower()]
+
+    def _bind_declared_user(
+        self,
+        path: str,
+        headers: Any,
+        result: AuthResult,
+        *,
+        channel: str,
+        remote: str,
+    ) -> AuthResult | None:
+        """Bind the user a Web or TUI connection declares to the token, or refuse the connection.
+
+        The connection's identity is the user_id it declares (query ``user_id``
+        or ``X-User-Id``), and AgentServer checks Session ownership against it.
+        Each source may declare once: a header container and a dict view of it
+        pick different values from repeats. Every declared value must be the
+        token's username; declaring nothing is allowed. The IAM user id is not
+        accepted, unlike on ``/file-api`` and the web proxy: runtimes, workspaces
+        and Session owners are keyed by username, so a connection named by its
+        IAM user id would not reach that user's own Sessions. When IAM names no
+        username there is no name to bind to, so every declaration is refused.
+        For Web the verified identity is recorded as
+        ``extensions["connection_user_id"]``, so the connection uses exactly the
+        name that was checked instead of reading the request again.
+        """
+        query_values = urllib.parse.parse_qs(urllib.parse.urlparse(path).query).get("user_id", [])
+        header_values = self._header_values(headers, "x-user-id")
+        if len(query_values) > 1 or len(header_values) > 1:
+            return self._refuse_declared_user(
+                result, "AMBIGUOUS_USER_ID", "user_id 声明不唯一", channel=channel, remote=remote,
+            )
+        declared_query = query_values[0].strip() if query_values else ""
+        declared_header = header_values[0].strip() if header_values else ""
+        username = ""
+        if isinstance(result.extensions, dict):
+            username = str(result.extensions.get("username") or "").strip()
+        declared = {value for value in (declared_query, declared_header) if value}
+        if not declared <= {username}:
+            return self._refuse_declared_user(
+                result, "USER_MISMATCH", "user_id 与 token 不匹配", channel=channel, remote=remote,
+                declared=declared,
+            )
+        if channel == ChannelType.WEB.value:
+            result.extensions = {**(result.extensions or {}), "connection_user_id": username if declared else ""}
+        return None
+
+    @staticmethod
+    def _refuse_declared_user(
+        result: AuthResult,
+        code: str,
+        error: str,
+        *,
+        channel: str,
+        remote: str,
+        declared: set[str] | None = None,
+    ) -> AuthResult:
+        log_agentos(
+            logger,
+            logging.WARNING,
+            "auth.user_mismatch",
+            user_id=result.user_id,
+            declared=",".join(sorted(declared or ())),
+            channel=channel,
+            remote=remote,
+            error=code,
+        )
+        return AuthResult(success=False, error=error, extensions={"error_code": code})
+
     async def _verify_request_token(
         self,
         *,
@@ -850,6 +933,11 @@ class AgentOSRouterClient(AgentServerClient):
             remote=remote,
             channel=channel,
         )
+        if result.success and self.auth_enabled and channel in _DECLARED_IDENTITY_CHANNELS:
+            # The original container: a dict view keeps only one of repeated values.
+            refused = self._bind_declared_user(path, headers, result, channel=channel, remote=remote)
+            if refused is not None:
+                return refused
         if channel == "web" and result.success:
             if self.auth_enabled:
                 if not str(result.user_id or "").strip():

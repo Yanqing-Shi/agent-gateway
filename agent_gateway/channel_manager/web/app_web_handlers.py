@@ -485,6 +485,8 @@ _FORWARD_REQ_METHODS = frozenset({
     "initialize",
     "session.switch",
     "session.fork",
+    "mode.set",
+    "mode.get",
     "acp.tool_response",
     # Client attachments (e.g. the Office Add-in): attaching a client, renewing it, and its read models.
     "client.attach",
@@ -738,6 +740,8 @@ _FORWARD_NO_LOCAL_HANDLER_METHODS = frozenset({
     "initialize",
     "session.switch",
     "session.fork",
+    "mode.set",
+    "mode.get",
     "acp.tool_response",
     "client.attach",
     "client.renew",

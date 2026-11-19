@@ -693,7 +693,13 @@ class WebChannel(BaseWsChannel):
         # 与 agent_os 稳定版一致。authenticated_user_id（IAM UUID）只作认证门禁，
         # 不参与工作区/沙箱身份推导：现有部署的用户目录按 username 布局
         # （/home/agentos/users/<username>），用 UUID 会导致建沙箱时目录校验失败。
-        connection_user_id = cls._extract_query_user_id(flat_query) or cls._extract_ws_header_user_id(ws)
+        # IAM 启用时握手已把声明值绑定到 token，并按同一优先级记下结果；直接使用它，
+        # 不再重读 query / 头，避免读到握手未校验的值。
+        verified = getattr(ws, "verified_user_id", None)
+        if isinstance(verified, str):
+            connection_user_id = verified or None
+        else:
+            connection_user_id = cls._extract_query_user_id(flat_query) or cls._extract_ws_header_user_id(ws)
         setattr(ws, _WEB_CONNECTION_USER_ID_ATTR, connection_user_id)
         return connection_user_id
 
@@ -2093,12 +2099,13 @@ class WebChannel(BaseWsChannel):
             ws, _flat_query, remote,
         )
         # 连接级权威身份：user_id + group/bot/gateway（进站时再拆到顶层 / routing）。
+        # user_id 取上面解析出的连接身份（IAM 启用时即握手校验过的值），其余字段取 query。
         from agent_gateway.common.request_identity import normalize_routing_identity
         from agent_gateway.enterprise import is_enterprise
 
         _routing = normalize_routing_identity(
-            _flat_query,
             {"user_id": connection_user_id} if connection_user_id else None,
+            _flat_query,
         )
         setattr(ws, "_web_routing", _routing)
         if is_enterprise() and not _routing.get("bot_id"):

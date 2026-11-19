@@ -484,3 +484,16 @@ async def test_enterprise_cron_missing_or_default_owner_never_broadcasts(monkeyp
         payload={"content": "private", "user_id": owner, "cron": {"job_id": "job-1"}},
     ))
     assert sent == []
+
+
+def test_resolve_connection_user_id_uses_the_identity_verified_at_handshake():
+    # With IAM on, the handshake bound this name to the token; the frame-level query and
+    # headers are not read again, so a value the check did not see cannot become the identity.
+    ws = type("Ws", (), {"verified_user_id": "alice", "request_headers": {"X-User-Id": "bob"}})()
+    assert WebChannel._resolve_connection_user_id({"user_id": "bob"}, ws) == "alice"
+    assert WebChannel._connection_user_id(ws) == "alice"
+
+
+def test_resolve_connection_user_id_verified_empty_means_no_declaration():
+    ws = type("Ws", (), {"verified_user_id": ""})()
+    assert WebChannel._resolve_connection_user_id({"user_id": "bob"}, ws) is None

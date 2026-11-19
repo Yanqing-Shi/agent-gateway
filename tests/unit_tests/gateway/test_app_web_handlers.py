@@ -2585,6 +2585,15 @@ def test_web_retains_mainline_group_and_session_asset_forwarding(method):
     assert method in app_web_handlers._FORWARD_NO_LOCAL_HANDLER_METHODS
 
 
+@pytest.mark.parametrize("method", ["mode.set", "mode.get"])
+def test_web_forwards_session_mode_requests_without_local_handler(method):
+    """AgentServer owns mode commits; the Gateway forwards them without a local reply."""
+    channel = _bind()
+    assert method not in channel.methods
+    assert method in app_web_handlers._FORWARD_REQ_METHODS
+    assert method in app_web_handlers._FORWARD_NO_LOCAL_HANDLER_METHODS
+
+
 def test_employee_artifact_list_is_forwarded_to_agent_server():
     method = "jiuwenmate.artifact.list"
     channel = _bind()
