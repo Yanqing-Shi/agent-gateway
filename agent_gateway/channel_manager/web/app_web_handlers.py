@@ -42,6 +42,7 @@ from openjiuwen.extensions.external_provider.openai_auth.openai_account_models i
     OpenAIAccountModelListError,
 )
 
+from agent_gateway.agent_client_mode import is_runtime_agent_client
 from agent_gateway.enterprise.edition import is_enterprise as _is_enterprise_edition
 from agent_gateway.channel_manager.web.task_asr import (
     TaskAsrError,
@@ -461,7 +462,8 @@ _JIUWENMATE_FORWARD_METHODS = frozenset({
     "jiuwenmate.welink_office.status",
 })
 
-# 仅转发到 Agent 的 Web method
+# 强制转发到 AgentServer 的 Web method。本地已注册同名 handler 时仍以转发为准；
+# 未登记的方法按“本地白名单 + 默认透传”处理，新增方法无需改动网关。
 _FORWARD_REQ_METHODS = frozenset({
     *_JIUWENMATE_FORWARD_METHODS,
     'group.create',
@@ -2289,11 +2291,11 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
                 "protocol_version": "1.0",
             },
         )
-        mh = _resolve(message_handler)
-        if mh:
-            await mh.publish_robot_messages(ack_msg)
-        else:
-            await channel.send(ack_msg)
+        # connection.ack 必须是握手首帧（前端与 ST 契约）。不能经
+        # robot_messages 队列异步派发：扩展在连接钩子里直接向 ws 写
+        # client.declarations，队列中的 ack 会晚于声明到达。channel.send
+        # 直接入本连接的发送队列，保证 ack 先于后续连接钩子产生的帧。
+        await channel.send(ack_msg)
 
     channel.on_connect(_on_connect)
 
@@ -2307,6 +2309,17 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     register_disconnect = getattr(channel, "on_disconnect", None)
     if callable(register_disconnect):
         register_disconnect(_on_disconnect)
+
+    # WebUI 扩展上行协议与扩展包管理协议统一注册在这里：前者转发给
+    # AgentServer 并合并 Gateway 域扩展的设置声明，后者先判归属、只处理
+    # Gateway 域包，其余继续交给 AgentServer。
+    from agent_gateway.channel_manager.web.extension_package_handlers import (
+        register_extension_package_handlers,
+    )
+    from agent_gateway.channel_manager.web.webui_handlers import register_webui_handlers
+
+    register_webui_handlers(channel, lambda: _resolve(agent_client))
+    register_extension_package_handlers(channel, lambda: _resolve(agent_client))
 
     async def _config_get(ws, req_id, params, session_id):
         """Serve the local enterprise config view through the Gateway."""
@@ -2580,7 +2593,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             resolved_client = _resolve(agent_client)
             use_local_config = _is_enterprise_edition() and (
                 resolved_client is None
-                or type(resolved_client).__name__ == "RuntimeRoutedAgentClient"
+                or is_runtime_agent_client(resolved_client)
                 or is_legacy_shared_directory_client(resolved_client)
             )
             if use_local_config:
@@ -3728,16 +3741,22 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
         doc="查询指定轮次 Diff 详情。",
     )
 
+    def _config_use_local_handler(resolved_client: Any) -> bool:
+        """Whether a config/models request must stay in the Gateway process."""
+        from agent_gateway.enterprise import is_enterprise
+        from agent_gateway.routing.e2a_proxy import is_legacy_shared_directory_client
+
+        return is_enterprise() and (
+            resolved_client is None
+            or is_runtime_agent_client(resolved_client)
+            or is_legacy_shared_directory_client(resolved_client)
+        )
+
     async def _path_get(ws, req_id, params, session_id, user_id=None):
         """读 browser.chrome_path 并返回给前端（会解析环境变量）。"""
         from e2a.message import ReqMethod
 
-        from agent_gateway.routing.e2a_proxy import (
-            is_legacy_shared_directory_client,
-            proxy_unary_request,
-        )
-
-        from agent_gateway.enterprise import is_enterprise
+        from agent_gateway.routing.e2a_proxy import proxy_unary_request
 
         resolved_client = _resolve(agent_client)
         # A4g 对齐：个人版 browser/jev 配置读写统一经目标 AgentServer——
@@ -3745,11 +3764,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
         # 启动环境会把已保存的 key 显示成"未配置"。企业版保留本地执行，
         # 判据与 _register_config_proxy 一致（RuntimeRouted / 无 client /
         # legacy 共享目录）。
-        use_local_path = is_enterprise() and (
-            resolved_client is None
-            or type(resolved_client).__name__ == "RuntimeRoutedAgentClient"
-            or is_legacy_shared_directory_client(resolved_client)
-        )
+        use_local_path = _config_use_local_handler(resolved_client)
         if not use_local_path:
             await proxy_unary_request(
                 channel=channel, agent_client=resolved_client, ws=ws, req_id=req_id,
@@ -3817,20 +3832,13 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
 
         from agent_gateway.routing.e2a_proxy import (
             fetch_agent_unary,
-            is_legacy_shared_directory_client,
             proxy_unary_request,
         )
-
-        from agent_gateway.enterprise import is_enterprise
 
         resolved_client = _resolve(agent_client)
         # A4g 对齐，同 _path_get：个人版统一经目标 AgentServer 写入；企业版
         # （RuntimeRouted / 无 client / legacy 共享目录）保留本地写回语义。
-        use_local_path = is_enterprise() and (
-            resolved_client is None
-            or type(resolved_client).__name__ == "RuntimeRoutedAgentClient"
-            or is_legacy_shared_directory_client(resolved_client)
-        )
+        use_local_path = _config_use_local_handler(resolved_client)
         if not use_local_path:
             # Fetch current browser config so the restart callback can match the
             # old runtime identity (custom binary / headed mode).
@@ -5666,6 +5674,19 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     channel.register_method("external_cli.install", _external_cli_install)
     channel.register_method("external_cli.custom_agent.remove", _external_cli_custom_agent_remove)
 
+    def _config_forward_params(ws, params: Any) -> Any:
+        """Drop client-supplied auth session and inject the connection's session."""
+        if not isinstance(params, dict):
+            return params
+        from e2a.constants import E2A_AUTH_SESSION_PARAM_KEY
+
+        forwarded = dict(params)
+        forwarded.pop(E2A_AUTH_SESSION_PARAM_KEY, None)
+        auth_session = str(getattr(ws, "_jiuwen_auth_session", "") or "").strip()
+        if auth_session:
+            forwarded[E2A_AUTH_SESSION_PARAM_KEY] = auth_session
+        return forwarded
+
     async def _proxy_config_request(
         ws, req_id, params, session_id, user_id=None, *, req_method,
         preserve_error_payload=False,
@@ -5760,31 +5781,18 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
         # legacy 共享目录的外部 CLI 依赖安装门控仍保留在 gateway。
 
         async def _handler(ws, req_id, params, session_id, user_id=None):
-            from agent_gateway.enterprise import is_enterprise
             from agent_gateway.routing.e2a_proxy import is_legacy_shared_directory_client
 
             resolved_client = _resolve(agent_client)
             # 仅企业版允许 Gateway 本地 config/models；个人版始终 E2A。
-            use_local_handler = (
-                resolved_client is None
-                or type(resolved_client).__name__ == "RuntimeRoutedAgentClient"
-                or is_legacy_shared_directory_client(resolved_client)
-            )
-            if local_handler is not None and is_enterprise() and use_local_handler:
+            use_local_handler = _config_use_local_handler(resolved_client)
+            if local_handler is not None and use_local_handler:
                 await local_handler(ws, req_id, params, session_id)
                 return
             # 登录会话 id 随请求转发（硬规则：客户端传来的键先删，只信连接属性）：
             # models.list 经目标 AgentServer 执行时无法看到 Gateway 连接，登录送的
             # 免费模型合并需要会话 id（AgentOS 既有缺口，A4g 统一后对 legacy 同样关键）。
-            if isinstance(params, dict):
-                from e2a.constants import E2A_AUTH_SESSION_PARAM_KEY
-
-                forwarded = dict(params)
-                forwarded.pop(E2A_AUTH_SESSION_PARAM_KEY, None)
-                auth_session = str(getattr(ws, "_jiuwen_auth_session", "") or "").strip()
-                if auth_session:
-                    forwarded[E2A_AUTH_SESSION_PARAM_KEY] = auth_session
-                params = forwarded
+            params = _config_forward_params(ws, params)
             if req_method in (
                 _ConfigReq.CONFIG_SET,
                 _ConfigReq.CONFIG_SAVE_ALL,
@@ -5801,6 +5809,64 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
         channel.register_method(method_name, _handler)
 
     from e2a.message import ReqMethod as _ConfigReq
+
+    async def _models_delete_with_references(
+        ws, req_id, params, session_id, user_id=None,
+    ):
+        """Delete a model only after the AS-side reference check succeeds."""
+        from agent_gateway.routing.e2a_proxy import fetch_agent_unary
+
+        resolved_client = _resolve(agent_client)
+        use_local = _config_use_local_handler(resolved_client)
+        if use_local:
+            await _model_resource_rpc(ws, req_id, params, session_id, "models.delete")
+            return
+
+        params = _config_forward_params(ws, params)
+        model_id = str((params or {}).get("model_id") or "").strip()
+        if not model_id:
+            await channel.send_response(
+                ws, req_id, ok=False,
+                error="model_id is required", code="BAD_REQUEST",
+            )
+            return
+
+        ok, refs_payload = await fetch_agent_unary(
+            agent_client=resolved_client,
+            req_method=_ConfigReq.MODELS_REFERENCES,
+            params=_config_forward_params(
+                ws, {"type": "model", "id": model_id}
+            ),
+            session_id=session_id,
+            user_id=user_id,
+            channel_id=channel.channel_id,
+            label="models.references",
+        )
+        if not isinstance(refs_payload, dict):
+            refs_payload = {}
+            ok = False
+        if not ok:
+            await channel.send_response(
+                ws, req_id, ok=False,
+                error=str(refs_payload.get("error") or "models.references failed"),
+                code=str(refs_payload.get("code") or "SERVICE_UNAVAILABLE"),
+            )
+            return
+
+        references = refs_payload.get("references") or []
+        if references:
+            await channel.send_response(
+                ws, req_id, ok=False,
+                error="resource is still referenced",
+                code="MODEL_SELECTION_REFERENCED",
+                payload={"references": references},
+            )
+            return
+
+        await _proxy_config_request(
+            ws, req_id, params, session_id, user_id,
+            req_method=_ConfigReq.MODELS_DELETE,
+        )
 
     multimodal_methods = (
         _ConfigReq.MULTIMODAL_MODELS_LIST, _ConfigReq.MULTIMODAL_MODELS_GET,
@@ -5834,8 +5900,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     _register_config_proxy("models.validate", _ConfigReq.MODELS_VALIDATE, _models_validate)
     _register_config_proxy("models.upsert", _ConfigReq.MODELS_UPSERT,
                            lambda *a: _model_resource_rpc(*a, "models.upsert"))
-    _register_config_proxy("models.delete", _ConfigReq.MODELS_DELETE,
-                           lambda *a: _model_resource_rpc(*a, "models.delete"))
+    channel.register_method("models.delete", _models_delete_with_references)
     _register_config_proxy("models.references", _ConfigReq.MODELS_REFERENCES,
                            lambda *a: _model_resource_rpc(*a, "models.references"))
     _register_config_proxy("model_groups.list", _ConfigReq.MODEL_GROUPS_LIST,
@@ -5856,7 +5921,12 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             req_id,
             ok=True,
             payload={
-                "agent_ready": ac is not None and bool(getattr(ac, "server_ready", False)),
+                # 优先读 agent_ready（Runtime 能否执行）；老客户端没这个属性时
+                # 退回 server_ready，避免把"传输连通"当成"可执行"。
+                "agent_ready": ac is not None
+                and bool(
+                    getattr(ac, "agent_ready", getattr(ac, "server_ready", False))
+                ),
                 "protocol_version": "1.0",
             },
         )
@@ -5922,39 +5992,52 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
     channel.register_method("path.select_file", _path_select_file)
 
     async def _hooks_list(ws, req_id, params, session_id, user_id=None):
-        # 单用户共享目录：本地读取 config.yaml（hooks 属用户态配置，共享目录等价；
-        # AgentServer 未启动/断连时保持可用）。AgentOS：经 E2A 在目标注入目录执行。
+        """Return Gateway session hooks plus AgentServer tool hooks."""
         from e2a.message import ReqMethod
 
-        from agent_gateway.routing.e2a_proxy import (
-            is_legacy_shared_directory_client,
-            proxy_unary_request,
+        from agent_gateway.common.hooks_config import (
+            load_hooks_config,
+            merge_hook_summaries,
         )
+        from agent_gateway.routing.e2a_proxy import fetch_agent_unary
 
-        resolved_client = _resolve(agent_client)
-        if resolved_client is None or is_legacy_shared_directory_client(resolved_client):
-            from agent_gateway.common.hooks_config import load_hooks_config
-
-            try:
-                hooks_config = load_hooks_config(get_config())
-                summary = hooks_config.get_event_summary()
-                await channel.send_response(
-                    ws, req_id, ok=True,
-                    payload={
-                        "events": summary,
-                        "disable_all_hooks": hooks_config.disable_all_hooks,
-                        "source": "config.yaml",
-                    },
-                )
-            except Exception as e:  # noqa: BLE001
-                await channel.send_response(ws, req_id, ok=False, error=str(e), code="INTERNAL_ERROR")
+        try:
+            gateway_hooks = load_hooks_config(get_config())
+            gateway_summary = gateway_hooks.get_event_summary()
+        except Exception as e:  # noqa: BLE001
+            await channel.send_response(ws, req_id, ok=False, error=str(e), code="INTERNAL_ERROR")
             return
 
-        await proxy_unary_request(
-            channel=channel, agent_client=_resolve(agent_client), ws=ws,
-            req_id=req_id, params={}, session_id=session_id, user_id=user_id,
-            req_method=ReqMethod.HOOKS_LIST, label="hooks.list",
+        resolved_client = _resolve(agent_client)
+        ok, agent_payload = await fetch_agent_unary(
+            agent_client=resolved_client,
+            req_method=ReqMethod.HOOKS_LIST,
+            params={},
+            session_id=session_id,
+            user_id=user_id,
+            channel_id=channel.channel_id,
+            label="hooks.list",
         )
+        if not isinstance(agent_payload, dict):
+            agent_payload = {}
+            ok = False
+        agent_summary = (
+            agent_payload.get("events")
+            if ok and isinstance(agent_payload.get("events"), list)
+            else []
+        )
+        agent_disable_all_hooks = (
+            bool(agent_payload.get("disable_all_hooks", False)) if ok else False
+        )
+        payload = merge_hook_summaries(
+            gateway_summary=gateway_summary,
+            agent_summary=agent_summary,
+            gateway_disable_all_hooks=gateway_hooks.disable_all_hooks,
+            agent_disable_all_hooks=agent_disable_all_hooks,
+            degraded=not ok,
+        )
+        payload["source"] = "merged" if ok else "gateway"
+        await channel.send_response(ws, req_id, ok=True, payload=payload)
 
     channel.register_method("memory.compute", _memory_compute)
     channel.register_method("hooks.list", _hooks_list)
@@ -6572,10 +6655,7 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             resolver = getattr(channel, "a4p_request_route", None)
             if resolver is not None and isinstance(request_id, str):
                 route = resolver(routes, request_id, ws=ws, session_id=session_id)
-            session_query = not request_id and req_method in {
-                ReqMethod.A4P_AUTHORIZATION_PENDING,
-                ReqMethod.A4P_CONFIG_GET, ReqMethod.A4P_CONFIG_UPDATE,
-            }
+            session_query = not request_id and req_method == ReqMethod.A4P_AUTHORIZATION_PENDING
             cached_routes = set()
             if route is None and req_method == ReqMethod.A4P_AUTHORIZATION_PENDING:
                 cached_routes = channel.a4p_pending_routes(routes, ws=ws, session_id=session_id)
@@ -6716,6 +6796,42 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
 
     from e2a.message import ReqMethod as _A4PReq
 
+    def _register_a4p_config(req_method: _A4PReq) -> None:
+        async def _handler(ws, req_id, params, session_id, user_id=None):
+            from agent_gateway.common.request_identity import WEB_IDENTITY_FIELDS
+            from agent_gateway.routing.e2a_proxy import proxy_unary_request
+
+            # Legacy clients can send a session ID. HTTP also merges tenant
+            # headers into params, while the normalized identity travels separately.
+            forwarded = {
+                key: value for key, value in params.items()
+                if key not in ("session_id", *WEB_IDENTITY_FIELDS)
+            }
+            is_update = req_method == _A4PReq.A4P_CONFIG_UPDATE
+            if forwarded.keys() - ({"enabled"} if is_update else set()):
+                await channel.send_response(
+                    ws, req_id, ok=False, code="BAD_REQUEST",
+                    error="Provide enabled only" if is_update else "a4p.config.get accepts no config fields",
+                )
+                return
+            await proxy_unary_request(
+                channel=channel,
+                agent_client=_resolve(agent_client),
+                ws=ws,
+                req_id=req_id,
+                params=forwarded,
+                session_id=None,
+                user_id=user_id,
+                req_method=req_method,
+                label="config",
+                metadata={"app_id": getattr(ws, "_jiuwen_app_id", None) or "default"},
+            )
+
+        channel.register_method(req_method.value, _handler, local_only=True)
+
+    _register_a4p_config(_A4PReq.A4P_CONFIG_GET)
+    _register_a4p_config(_A4PReq.A4P_CONFIG_UPDATE)
+
     def _register_a4p(method_name: str, req_method: Any) -> None:
         async def _handler(ws, req_id, params, session_id, user_id=None):
             await _forward_a4p_to_agent(
@@ -6724,8 +6840,6 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
 
         channel.register_method(method_name, _handler)
 
-    _register_a4p("a4p.config.get", _A4PReq.A4P_CONFIG_GET)
-    _register_a4p("a4p.config.update", _A4PReq.A4P_CONFIG_UPDATE)
     _register_a4p("a4p.authorization.reprepare", _A4PReq.A4P_AUTHORIZATION_REPREPARE)
     _register_a4p("a4p.authorization.complete", _A4PReq.A4P_AUTHORIZATION_COMPLETE)
     _register_a4p("a4p.authorization.reject", _A4PReq.A4P_AUTHORIZATION_REJECT)

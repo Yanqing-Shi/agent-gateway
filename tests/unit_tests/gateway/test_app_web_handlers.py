@@ -53,7 +53,7 @@ class FakeWebChannel:
         self.methods: dict[str, object] = {}
         self.responses: list[dict] = []
         self.connect_handler = None
-        self.disconnect_handler = None
+        self.disconnect_handlers: list = []
         self.routing_keys: list[RoutingKey] = []
         self.rebounds: list[tuple[str | None, str]] = []
         self.cleared: list[str | None] = []
@@ -65,7 +65,8 @@ class FakeWebChannel:
         self.connect_handler = handler
 
     def on_disconnect(self, handler):
-        self.disconnect_handler = handler
+        # The real WebChannel keeps every hook; a single slot would hide later registrations.
+        self.disconnect_handlers.append(handler)
 
     async def send_response(self, ws, req_id, *, ok, payload=None, error=None, code=None):
         self.responses.append({
@@ -367,7 +368,7 @@ class FakeReloadAgentClient:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", [
-    "a4p.config.get", "a4p.config.update", "a4p.authorization.reprepare",
+    "a4p.authorization.reprepare",
     "a4p.authorization.complete", "a4p.authorization.reject", "a4p.authorization.pending",
 ])
 @pytest.mark.parametrize("user_id", ["authenticated-user", None])
@@ -426,10 +427,9 @@ async def test_a4p_rpc_uses_current_websocket_route(method, user_id) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("method", ["a4p.authorization.pending", "a4p.config.get", "a4p.config.update"])
-async def test_a4p_rpc_rejects_websocket_without_session_route(method) -> None:
+async def test_a4p_pending_rejects_websocket_without_session_route() -> None:
     channel = _bind(agent_client=SimpleNamespace(server_ready=True))
-    await channel.methods[method](
+    await channel.methods["a4p.authorization.pending"](
         SimpleNamespace(_jiuwen_ws_id="ws-1"), "rpc-1", {}, "session-1"
     )
     assert channel.responses[-1]["ok"] is False
@@ -437,8 +437,7 @@ async def test_a4p_rpc_rejects_websocket_without_session_route(method) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("method", ["a4p.authorization.pending", "a4p.config.get", "a4p.config.update"])
-async def test_a4p_rpc_http_outbound_allows_empty_agent_ref_without_route(method) -> None:
+async def test_a4p_pending_http_outbound_allows_empty_agent_ref_without_route() -> None:
     """HTTP Outbound 无 WS 路由时仍可转发，metadata 留空 app/agent 交给 AS 跳过匹配。"""
 
     class _AgentClient:
@@ -456,7 +455,7 @@ async def test_a4p_rpc_http_outbound_allows_empty_agent_ref_without_route(method
     _bind(channel, agent_client=agent_client)
     ws = SimpleNamespace(_jiuwen_ws_id="http-out-1", is_http_outbound=True)
 
-    await channel.methods[method](ws, "rpc-1", {}, "session-1")
+    await channel.methods["a4p.authorization.pending"](ws, "rpc-1", {}, "session-1")
 
     assert channel.responses[-1]["ok"] is True
     assert agent_client.envelope.channel_context == {
@@ -778,7 +777,8 @@ async def test_web_disconnect_unregisters_physical_subscriptions() -> None:
     message_handler = FakeMessageHandler()
     channel = _bind(message_handler=message_handler)
     ws = SimpleNamespace(_jiuwen_ws_id="web-ws-dead")
-    await channel.disconnect_handler(ws, {"sess-web"})
+    for handler in channel.disconnect_handlers:
+        await handler(ws, {"sess-web"})
     assert message_handler.disconnected_websockets == [("web", "web-ws-dead")]
 
 
@@ -1557,12 +1557,13 @@ async def test_enterprise_runtime_routed_path_uses_local_execution(monkeypatch) 
     # 该判据下 config.set/save_all 本就是 Gateway 本地 handler（runtime HTTP 无
     # config REST，企业配置读 Gateway Manager 库），path 读写保持同侧，避免
     # "保存写 Gateway 侧、读取却代理到 Pod"的企业版读写分离。
-    class RuntimeRoutedAgentClient:
-        """只借用这个类名，测试不加载扩展包。"""
+    class RenamedRuntimeClient:
+        """显式声明 runtime 能力，不依赖实现类名。"""
+        agent_client_mode = "runtime"
 
     monkeypatch.setattr("agent_gateway.enterprise.is_enterprise", lambda: True)
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
-    client = RuntimeRoutedAgentClient()
+    client = RenamedRuntimeClient()
     saved_configs: list[dict] = []
     monkeypatch.setattr(app_web_handlers, "update_browser_in_config", lambda config: saved_configs.append(config))
     monkeypatch.setattr(
@@ -1704,6 +1705,145 @@ async def test_memory_forbidden_set_without_agent_server_is_unavailable(monkeypa
     assert resp["ok"] is False
     assert resp["code"] == "SERVICE_UNAVAILABLE"
     assert resp["error"] == "AgentServer is unavailable"
+
+
+@pytest.mark.asyncio
+async def test_models_delete_checks_agent_server_references_first(monkeypatch) -> None:
+    from agent_gateway.routing import e2a_proxy
+
+    monkeypatch.setattr("agent_gateway.enterprise.is_enterprise", lambda: False)
+    client = WebSocketAgentServerClient()
+    client._apply_connection_ack({"payload": {"readiness": "AGENT_READY"}})
+    references = [{"scope": "agent", "scope_id": "agent_leader"}]
+    fetch = AsyncMock(return_value=(True, {"references": references}))
+    monkeypatch.setattr(e2a_proxy, "fetch_agent_unary", fetch)
+    channel = _bind(agent_client=client)
+
+    await channel.methods["models.delete"](
+        object(), "delete-model", {"model_id": "mdl_test"}, "session-1", "user-1",
+    )
+
+    fetch.assert_awaited_once()
+    request = fetch.call_args.kwargs
+    assert request["req_method"] is ReqMethod.MODELS_REFERENCES
+    assert request["params"] == {"type": "model", "id": "mdl_test"}
+    assert channel.responses[-1]["ok"] is False
+    assert channel.responses[-1]["code"] == "MODEL_SELECTION_REFERENCED"
+    assert channel.responses[-1]["payload"] == {"references": references}
+
+
+@pytest.mark.asyncio
+async def test_models_delete_forwards_after_references_empty(monkeypatch) -> None:
+    from agent_gateway.routing import e2a_proxy
+
+    monkeypatch.setattr("agent_gateway.enterprise.is_enterprise", lambda: False)
+    client = WebSocketAgentServerClient()
+    client._apply_connection_ack({"payload": {"readiness": "AGENT_READY"}})
+    fetch = AsyncMock(return_value=(True, {"references": []}))
+    proxy = AsyncMock()
+    monkeypatch.setattr(e2a_proxy, "fetch_agent_unary", fetch)
+    monkeypatch.setattr(e2a_proxy, "proxy_unary_request", proxy)
+    channel = _bind(agent_client=client)
+
+    await channel.methods["models.delete"](
+        object(), "delete-model-ok", {"model_id": "mdl_test"}, "session-1", "user-1",
+    )
+
+    request = proxy.call_args.kwargs
+    assert request["req_method"] is ReqMethod.MODELS_DELETE
+    assert request["params"] == {"model_id": "mdl_test"}
+
+
+@pytest.mark.asyncio
+async def test_hooks_list_degrades_when_agent_is_unavailable(monkeypatch) -> None:
+    from agent_gateway.routing import e2a_proxy
+
+    client = WebSocketAgentServerClient()
+    client._apply_connection_ack({"payload": {"readiness": "AGENT_READY"}})
+    fetch = AsyncMock(return_value=(False, {"error": "down"}))
+    monkeypatch.setattr(e2a_proxy, "fetch_agent_unary", fetch)
+    channel = _bind(agent_client=client)
+
+    await channel.methods["hooks.list"](
+        object(), "hooks-degraded", {}, "session-1", "user-1",
+    )
+
+    payload = channel.responses[-1]["payload"]
+    assert payload["degraded"] is True
+    assert payload["source"] == "gateway"
+    assert payload["events"]
+
+
+@pytest.mark.asyncio
+async def test_hooks_list_degrades_on_non_dict_agent_payload(monkeypatch) -> None:
+    from agent_gateway.routing import e2a_proxy
+
+    client = WebSocketAgentServerClient()
+    client._apply_connection_ack({"payload": {"readiness": "AGENT_READY"}})
+    fetch = AsyncMock(return_value=(True, "not-a-dict"))
+    monkeypatch.setattr(e2a_proxy, "fetch_agent_unary", fetch)
+    channel = _bind(agent_client=client)
+
+    await channel.methods["hooks.list"](
+        object(), "hooks-bad-payload", {}, "session-1", "user-1",
+    )
+
+    payload = channel.responses[-1]["payload"]
+    assert payload["degraded"] is True
+    assert payload["source"] == "gateway"
+    assert payload["events"]
+
+
+@pytest.mark.asyncio
+async def test_models_delete_rejects_non_dict_references_payload(monkeypatch) -> None:
+    from agent_gateway.routing import e2a_proxy
+
+    monkeypatch.setattr("agent_gateway.enterprise.is_enterprise", lambda: False)
+    client = WebSocketAgentServerClient()
+    client._apply_connection_ack({"payload": {"readiness": "AGENT_READY"}})
+    fetch = AsyncMock(return_value=(True, "not-a-dict"))
+    proxy = AsyncMock()
+    monkeypatch.setattr(e2a_proxy, "fetch_agent_unary", fetch)
+    monkeypatch.setattr(e2a_proxy, "proxy_unary_request", proxy)
+    channel = _bind(agent_client=client)
+
+    await channel.methods["models.delete"](
+        object(), "delete-model-bad-payload", {"model_id": "mdl_test"}, "session-1", "user-1",
+    )
+
+    response = channel.responses[-1]
+    assert response["ok"] is False
+    assert response["code"] == "SERVICE_UNAVAILABLE"
+    proxy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_models_delete_uses_connection_auth_session(monkeypatch) -> None:
+    from e2a.constants import E2A_AUTH_SESSION_PARAM_KEY
+    from agent_gateway.routing import e2a_proxy
+
+    monkeypatch.setattr("agent_gateway.enterprise.is_enterprise", lambda: False)
+    client = WebSocketAgentServerClient()
+    client._apply_connection_ack({"payload": {"readiness": "AGENT_READY"}})
+    fetch = AsyncMock(return_value=(True, {"references": [{"scope": "agent"}]}))
+    monkeypatch.setattr(e2a_proxy, "fetch_agent_unary", fetch)
+    channel = _bind(agent_client=client)
+    ws = SimpleNamespace(_jiuwen_auth_session="trusted-session")
+
+    await channel.methods["models.delete"](
+        ws,
+        "delete-model-auth",
+        {"model_id": "mdl_test", E2A_AUTH_SESSION_PARAM_KEY: "client-session"},
+        "session-1",
+        "user-1",
+    )
+
+    request = fetch.call_args.kwargs
+    assert request["params"] == {
+        "type": "model",
+        "id": "mdl_test",
+        E2A_AUTH_SESSION_PARAM_KEY: "trusted-session",
+    }
 
 
 class FakeUpdaterService:

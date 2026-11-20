@@ -18,7 +18,7 @@ import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, KeysView
 from weakref import WeakKeyDictionary
 from urllib.parse import parse_qs, urlparse
 
@@ -61,6 +61,9 @@ from agent_gateway.common.ws_diagnostics import (
 from agent_gateway.routing.base_ws_channel import BaseWsChannel
 from agent_gateway.routing.keys import AgentRef, RoutingKey
 from agent_gateway.routing.session_sharing import RoutingTarget
+
+if TYPE_CHECKING:
+    from agent_gateway.transport.uvicorn_listener import UvicornListener
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +163,7 @@ _TRAJECTORY_HINT_COALESCE_SECONDS = 0.016
 _WEB_FULL_PAYLOAD_EVENT_TYPES = frozenset(
     {
         "connection.ack",
+        "extensions.v2.installed",
         "todo.updated",
         "chat.tool_call",
         "chat.tool_update",
@@ -275,7 +279,14 @@ class WebChannel(BaseWsChannel):
         self.config: WebChannelConfig = config
         # Phase 2：注入 AgentServerClient，供 _process_files 文件导入 E2A 转发使用
         self.agent_client: Any = agent_client
-        self._uvicorn_server: Any = None
+        self._listener: UvicornListener | None = None
+        self._listener_available = asyncio.Event()
+        self._listener_start_error: Exception | None = None
+        self._starting = False
+        # Extension runtime starts on first use: its cold Core import can take seconds
+        # and must never delay listener readiness or shutdown.
+        self._extensions_active = False
+        self._extensions_lock = asyncio.Lock()
         self._on_message_cb: Callable[[Message], Any] | None = None
         self._method_handlers: dict[str, MethodHandler] = {}
         self._local_only_methods: set[str] = set(_LOCAL_ONLY_METHODS)
@@ -453,6 +464,10 @@ class WebChannel(BaseWsChannel):
         """Remove a dynamically registered method and its routing metadata."""
         self._method_handlers.pop(method, None)
         self._local_only_methods.discard(method)
+
+    def registered_methods(self) -> KeysView[str]:
+        """已注册方法名的只读视图，供入站转发策略判断本地方法。"""
+        return self._method_handlers.keys()
 
     def on_message(self, callback: Callable[[Message], None]) -> None:
         """注册消息接收回调（替代默认的 router.publish_user_messages）。"""
@@ -910,65 +925,101 @@ class WebChannel(BaseWsChannel):
 
     async def start(self) -> None:
         """启动 WebSocket 服务并监听客户端连接."""
-        if self._running:
+        if self._running or self._starting:
             logger.warning("WebChannel 已在运行")
             return
         if not self.config.enabled:
             logger.warning("WebChannel 未启用（enabled=False）")
             return
 
+        self._starting = True
+        self._listener = None
+        self._listener_start_error = None
+        self._listener_available.clear()
         try:
             await self._start_uvicorn_server()
+        except asyncio.CancelledError:
+            self._listener_start_error = RuntimeError("WebChannel stopped before becoming ready")
+            self._listener_available.set()
+            raise
+        except Exception as error:
+            self._listener_start_error = error
+            self._listener_available.set()
+            raise
         finally:
+            await self._shutdown_extensions()
+            self._starting = False
+            self._running = False
             self._stop_trajectory_hints()
+
+    async def wait_ready(self) -> None:
+        """Wait for the current listener or propagate its startup failure."""
+        await self._listener_available.wait()
+        if self._listener_start_error is not None:
+            raise self._listener_start_error
+        if self._listener is None:
+            raise RuntimeError("WebChannel stopped before becoming ready")
+        await self._listener.wait_ready()
+
+    async def ensure_extensions(self, ws: Any = None) -> None:
+        """Start the extension runtime on first use and announce ``ws`` to it.
+
+        The runtime imports Core and every installed package synchronously, so it
+        starts on the first extension-bearing frame instead of during ``start()``.
+        """
+
+        if self._extensions_active:
+            return
+        async with self._extensions_lock:
+            if self._extensions_active:
+                return
+            from agent_gateway.extensions_v2 import init_gateway_extensions, notify_gateway_connect
+
+            runtime = await init_gateway_extensions(self)
+            self._extensions_active = True
+            if runtime is not None and ws is not None:
+                # The connection that triggered the lazy start missed the channel's
+                # on_connect hook; announce it now so it still receives declarations.
+                await notify_gateway_connect(ws)
+
+    async def _shutdown_extensions(self) -> None:
+        """Stop the extension runtime if this channel ever started it."""
+
+        if not self._extensions_active:
+            return
+        async with self._extensions_lock:
+            if not self._extensions_active:
+                return
+            from agent_gateway.extensions_v2 import shutdown_gateway_extensions
+
+            self._extensions_active = False
+            await shutdown_gateway_extensions()
 
     async def _start_uvicorn_server(self) -> None:
         """同一端口承载 WebChannel 的 WebSocket 与 HTTP 路由（uvicorn/FastAPI）。"""
-        import uvicorn
-
-        from agent_gateway.channel_manager.web.transport_stall_guard import (
-            guarded_http_protocol,
-            guarded_websockets_protocol,
-        )
         from agent_gateway.channel_manager.web.web_channel_app import build_web_channel_app
-        from agent_gateway.common.ws_limits import WEB_WS_MAX_MESSAGE_BYTES
+        from agent_gateway.transport.uvicorn_listener import UvicornListener
 
-        app = build_web_channel_app(self)
-        uv_cfg = uvicorn.Config(
-            app,
+        listener = UvicornListener(
+            build_web_channel_app(self),
             host=self.config.host,
             port=self.config.port,
-            log_level="info",
-            access_log=False,
-            ws_max_size=WEB_WS_MAX_MESSAGE_BYTES,
-            ws_ping_interval=20.0,
-            ws_ping_timeout=60.0,
-            # 停止读取的客户端会让 transport 写缓冲滞留，close() 永远等不到排空，
-            # socket 永久卡在 CLOSE-WAIT（issue #4946）；带看门狗的协议类在写停滞
-            # 超时后直接 abort，释放 fd 与缓冲。
-            http=guarded_http_protocol(),
-            ws=guarded_websockets_protocol(),
             ws_per_message_deflate=self.config.ws_permessage_deflate,
         )
-
-        class EmbeddedUvicornServer(uvicorn.Server):
-            @contextmanager
-            def capture_signals(self):
-                # The Gateway owns process signals and coordinates all of its
-                # component shutdowns. Re-raising a captured signal from this
-                # nested server would interrupt that cleanup and leave its task
-                # with an unobserved KeyboardInterrupt.
-                yield
-
-        self._uvicorn_server = EmbeddedUvicornServer(uv_cfg)
-        self._running = True
-        logger.info(
-            "WebChannel 已启动: ws://%s:%s%s (HTTP+WS same port)",
-            self.config.host,
-            self.config.port,
-            self.config.path,
-        )
-        await self._uvicorn_server.serve()
+        self._listener = listener
+        self._listener_available.set()
+        try:
+            await listener.start()
+            self._running = True
+            logger.info(
+                "WebChannel 已启动: ws://%s:%s%s (HTTP+WS same port)",
+                self.config.host,
+                self.config.port,
+                self.config.path,
+            )
+            await listener.wait_closed()
+        finally:
+            await listener.stop()
 
     async def ensure_web_proxy_session(self) -> aiohttp.ClientSession:
         """Return the shared aiohttp session, creating it once per channel.
@@ -1010,6 +1061,7 @@ class WebChannel(BaseWsChannel):
         """停止 WebSocket 服务并清理连接."""
         self._running = False
         self._stop_trajectory_hints()
+        await self._shutdown_extensions()
 
         all_clients = list(self.clients)
         close_tasks = [client.close(code=1001, reason="server shutdown") for client in all_clients]
@@ -1042,9 +1094,11 @@ class WebChannel(BaseWsChannel):
             except Exception:  # noqa: BLE001
                 pass
             setattr(self, attr, None)
-        if self._uvicorn_server is not None:
-            self._uvicorn_server.should_exit = True
-            self._uvicorn_server = None
+        if self._listener is not None:
+            await self._listener.stop()
+        else:
+            self._listener_start_error = RuntimeError("WebChannel stopped before becoming ready")
+            self._listener_available.set()
         # 兜底清理未走正常断连路径的 writer 协程（正常断连已由 unregister_ws 清理）
         await self._shutdown_all_writers()
         logger.info("WebChannel 已停止")
@@ -2063,7 +2117,7 @@ class WebChannel(BaseWsChannel):
 
         # ── V2: 从 query 提取身份字段，构造默认 RoutingKey ──
         # session_id 和 agent_id 可能在首条消息中更新
-        _app_id = _flat_query.get("app_id", "default")
+        _app_id = _flat_query.get("app_id") or "default"
         setattr(ws, "_jiuwen_app_id", _app_id)
         _mode = _flat_query.get("mode", "agent")
         _agent_id = _flat_query.get("agent_id", "default")
@@ -2261,7 +2315,7 @@ class WebChannel(BaseWsChannel):
         connection_user_id, _user_id = self._resolve_ws_identity(
             ws, flat_query, remote,
         )
-        _app_id = flat_query.get("app_id", "default")
+        _app_id = flat_query.get("app_id") or "default"
         _rk = RoutingKey(
             user_id=_user_id,
             channel_id=self.channel_id,
@@ -2431,13 +2485,31 @@ class WebChannel(BaseWsChannel):
                 await self.send_response(ws, req_id, ok=False, error=error, code=code)
                 return
 
+        # 扩展运行时先于原生方法分发处理 Gateway 域扩展事件；无 handler 时
+        # 原样返回 params，路径与未接入扩展完全一致。request_context.headers
+        # 随帧透传，认证类扩展据此判断 authorization 是否存在。
+        from agent_gateway.extensions_v2 import intercept_gateway_frame
+
+        request_context = data.get("request_context")
+        if request_context is not None and not isinstance(request_context, dict):
+            await self.send_response(ws, req_id, ok=False, error="invalid request context", code="BAD_REQUEST")
+            return
+        await self.ensure_extensions(ws)
+        _visited, params = await intercept_gateway_frame(
+            ws, req_id, method, params, request_context=request_context
+        )
+        if _visited:
+            return
+
         # ── V2: session_id 解析 ──
         # 请求自带 session_id（如 chat.send）→ 用它更新 ws 路由注册。
         # 请求未带 session_id（如 memory.compute 心跳、updater.check、config.get
         # 等 ws 层 keepalive / 拉取请求）→ 这类请求与 session 无关，
         # 仅合成一个临时 id 供后续 Message 构造使用，但【不】参与 register_ws，
         # 保留 ws 上一次的真实 RoutingKey，避免把 ws 从其所属 team session 摘除。
-        _explicit_session_id = params.get("session_id")
+        _explicit_session_id = (
+            None if method in {"a4p.config.get", "a4p.config.update"} else params.get("session_id")
+        )
         has_explicit_session = _explicit_session_id is not None and _explicit_session_id != ""
         try:
             if method in {"chat.send", "chat.resume"} and "group_id" in params:
@@ -2504,7 +2576,7 @@ class WebChannel(BaseWsChannel):
         _flat_query = {k: (v[0] if v else "") for k, v in query.items()}
         _mode = params.get("mode", "agent")
         _agent_id = params.get("agent_id", "default")
-        _app_id = _flat_query.get("app_id", "default")
+        _app_id = _flat_query.get("app_id") or "default"
         req_user_id = self._connection_user_id(ws)
         if has_explicit_session and not method.startswith("a4p."):
             _rk = RoutingKey(
@@ -2743,6 +2815,20 @@ class WebChannel(BaseWsChannel):
             "payload": payload,
         }
         return frame
+
+    @staticmethod
+    def _parse_req_method(method: str) -> ReqMethod | None:
+        for item in ReqMethod:
+            if item.value == method:
+                return item
+        # 协议包尚未发布的业务方法：运行时补齐枚举成员，避免在
+        # _normalize_gateway_message 里被当成 CHAT_SEND 处理。
+        from agent_gateway.common.protocol_compat import ensure_req_method
+
+        return ensure_req_method(method)
+
+    # Public aliases for HTTP dispatch (G.CLS.11).
+    parse_req_method = _parse_req_method
 
     @staticmethod
     def _parse_mode(raw_mode: Any) -> Mode:

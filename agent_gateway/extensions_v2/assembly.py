@@ -81,10 +81,12 @@ async def shutdown_gateway_extensions() -> None:
     global _ASSEMBLY, _LOCAL_CLI
     async with _LOCK:
         assembly, _ASSEMBLY = _ASSEMBLY, None
+        # Take the CLI reference in the same critical section: a concurrent install
+        # may publish a new one while the old runtime is still closing.
+        local_cli, _LOCAL_CLI = _LOCAL_CLI, None
+        if local_cli is not None:
+            await local_cli.close()
     if assembly is not None:
-        if _LOCAL_CLI is not None:
-            await _LOCAL_CLI.close()
-            _LOCAL_CLI = None
         await assembly.runtime.shutdown()
 
 
@@ -119,22 +121,10 @@ def _hook_disconnect(channel: Any) -> None:
     register = getattr(channel, "on_disconnect", None)
     if not callable(register):
         return
-    from agent_gateway.extensions_v2 import notify_gateway_disconnect
+    from agent_gateway.extensions_v2 import notify_gateway_connect, notify_gateway_disconnect
 
     register(notify_gateway_disconnect)
     connect = getattr(channel, "on_connect", None)
     if callable(connect):
-        async def browser_connected(ws):
-            runtime = get_gateway_runtime()
-            if runtime is None:
-                return
-            # Every connection receives declarations, including the empty ``packages`` of a
-            # runtime without client-capability packages. A browser that reconnects after a
-            # restart with every plugin disabled otherwise waits for a snapshot that never
-            # arrives and rejects each business request as CLIENT_DECLARATIONS_REQUIRED (S_06).
-            connection_id = await runtime.connection_id(ws)
-            if not connection_id:
-                return
-            await runtime.browser.connect(ws, connection_id)
-        connect(browser_connected)
+        connect(notify_gateway_connect)
     setattr(channel, "_gateway_extensions_hooked", True)

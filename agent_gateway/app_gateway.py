@@ -28,7 +28,7 @@ import sys
 import time
 import uuid as uuid_module
 from dataclasses import dataclass, field, replace
-from typing import Any, Awaitable, Callable
+from typing import AbstractSet, Any, Awaitable, Callable
 from urllib.parse import parse_qs, urlparse
 
 # Include entry-module import/configuration work in later startup phase logs.
@@ -48,9 +48,16 @@ from e2a.message import (
     Message,
     Mode,
 )
-from agent_gateway.common.protocol_methods import ReqMethod
+from agent_gateway.common.protocol_methods import ReqMethod, register_edition_req_methods
 from agent_gateway.common.request_method import parse_request_method
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError
+
+from agent_gateway.channel_manager.web.req_method_routing import (
+    ROUTE_DENIED,
+    ROUTE_FORWARD_UNKNOWN,
+    ROUTE_LOCAL,
+    route_req_method,
+)
 
 from agent_gateway.common.ws_diagnostics import (
     describe_ws_exception,
@@ -79,39 +86,19 @@ _TUI_FOREGROUND_METHODS = frozenset({
     "session.create", "session.switch", "history.get", "chat.send", "chat.resume",
 })
 # --- Early --dotenv parsing (before jiuwenswarm imports) ---
-from agent_gateway.dotenv_early import load_dotenv_runtime, parse_dotenv_early
-
-parse_dotenv_early("agent-gateway")
-_mark_startup_import_phase("dotenv_parsed")
-
-# 日志引导：须先于任何可能创建 openjiwen logger 的导入执行。
-from agent_gateway.common.openjiuwen_logging import (
-    configure_openjiuwen_core_logging,
-    configure_openjiuwen_runtime_logging,
+from agent_gateway.startup.bootstrap import (
+    apply_group_environment,
+    configure_process_logging,
+    initialize_early_environment,
+    prepare_group_workspace,
 )
 
-configure_openjiuwen_runtime_logging()
-# 未自管 yaml 时压制 openjiwen 内部日志（保留 Gateway 自身日志）。
-configure_openjiuwen_core_logging(suppress_level=logging.CRITICAL)
-_mark_startup_import_phase("third_party_logging_pinned")
-
-# Gateway 自带日志初始化：共同安装时母仓已配置则复用，独立安装时按同一路径自建
-from agent_gateway.common.logging_setup import setup_gateway_logger
-
-setup_gateway_logger()
-_mark_startup_import_phase("logging_ready")
+initialize_early_environment(_mark_startup_import_phase)
+configure_process_logging(_mark_startup_import_phase)
 
 # Standalone entrypoints retain workspace preparation; Desktop/app already do
 # it before spawning us and pass the marker to avoid duplicate disk work.
-from agent_gateway.common.paths import (
-    cleanup_stale_openjiuwen_descs,
-    prepare_runtime_workspace,
-)
-
-cleanup_stale_openjiuwen_descs()
-if os.environ.get("JIUWENSWARM_RUNTIME_WORKSPACE_READY") != "1":
-    prepare_runtime_workspace(cleanup_stale_descs=False)
-_mark_startup_import_phase("runtime_workspace_ready")
+prepare_group_workspace(_mark_startup_import_phase)
 
 from agent_gateway.channel_manager.base import BaseWebChannel
 
@@ -161,10 +148,9 @@ _mark_startup_import_phase("gateway_core_imports_loaded")
 
 _mark_startup_import_phase("logging_configured")
 
-_env_file = get_env_file()
-load_dotenv_runtime(dotenv_path=_env_file, override=True)
-apply_free_search_runtime_defaults()
-_mark_startup_import_phase("runtime_environment_applied")
+apply_group_environment(_mark_startup_import_phase)
+
+register_edition_req_methods()
 
 logger = logging.getLogger("gateway")
 
@@ -364,6 +350,7 @@ def _normalize_gateway_message(msg):
         stream_seq=msg.stream_seq,
         stream_id=msg.stream_id,
         metadata=msg.metadata,
+        app_id=getattr(msg, "app_id", None),
         user_id=getattr(msg, "user_id", None),
     )
     attach_message_trace(normalized, get_message_trace(msg))
@@ -440,41 +427,6 @@ def _inject_session_work_mode(msg: Message) -> None:
     # 该标志区分"用户显式传 work_mode"(需做 Project 一致性校验)与
     # "gateway 注入通道默认 work_mode"(跳过一致性校验,以 Project 记录为准)。
     params["_work_mode_explicit"] = binding.has_explicit_work_mode
-
-
-def _make_inbound_forwarder(
-        channel_manager: Any,
-        forward_methods: set[str] | frozenset[str],
-        no_local_methods: set[str] | frozenset[str],
-        source_label: str,
-) -> Callable[[Message], Awaitable[bool]]:
-    """Build a channel's inbound callback that forwards whitelisted methods to MessageHandler.
-
-    The callback returns True when forwarding fully handles the request, so the
-    channel sends no local reply; False lets the channel run its local handler.
-    """
-    async def _norm_and_forward(msg: Message) -> bool:
-        method_val = getattr(getattr(msg, "req_method", None), "value", None) or ""
-        if method_val not in forward_methods:
-            return False
-        with trace_stage("preprocess.credentials"):
-            await _refresh_expired_login_credential(msg)
-        normalized = _normalize_gateway_message(msg)
-        # session.create 主路径注入 work_mode 归一化(与 fallback _session_create
-        # 共用同一 helper resolve_session_work_mode_params,保持主路径/fallback 一致):
-        # 成功时写回归一化后的 project_id/project_dir/work_mode 到 params,
-        # 转发到 AgentServer 后由其 session.create 处理逻辑使用;
-        # 失败时(非法 work_mode)不写回,保留原始 params 由 AgentServer 或
-        # fallback _session_create 返回 BAD_REQUEST。
-        if method_val == "session.create":
-            _inject_session_work_mode(normalized)
-        await channel_manager.deliver_to_message_handler(normalized)
-        logger.debug("[App] %s 入站 -> MessageHandler: id=%s channel_id=%s", source_label, msg.id, msg.channel_id)
-        if method_val in no_local_methods:
-            return True
-        return False
-
-    return _norm_and_forward
 
 
 class _InboundGatewayServer:
@@ -622,27 +574,49 @@ async def _wait_for_web_channel_listening(
 ) -> None:
     """Wait until WebChannel has actually bound its listening socket.
 
-    ``WebChannel.start`` logs before ``uvicorn.Server.serve`` completes its
-    startup, so merely scheduling the task is not sufficient to make 19000
-    available.  Desktop and the static proxy both rely on that port during
-    cold start; bind it before the potentially expensive channel config pass.
+    Scheduling ``WebChannel.start`` does not imply listening readiness. Use
+    its public listener boundary before the potentially expensive channel
+    config pass; Desktop and the static proxy rely on that port at cold start.
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if task.done():
+    ready = asyncio.create_task(channel.wait_ready(), name="web-channel-ready")
+    try:
+        done, _ = await asyncio.wait({ready, task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
             task.result()
             raise RuntimeError("WebChannel stopped before it began listening")
-        uvicorn_server = getattr(channel, "_uvicorn_server", None)
-        if bool(getattr(uvicorn_server, "started", False)) or getattr(channel, "_server", None) is not None:
-            logger.info(
-                "[App] WebChannel listening: ws://%s:%s%s",
-                channel.config.host,
-                channel.config.port,
-                channel.config.path,
-            )
-            return
-        await asyncio.sleep(0.01)
-    raise TimeoutError(f"WebChannel did not bind its listening socket within {timeout:.0f}s")
+        if ready not in done:
+            raise TimeoutError(f"WebChannel did not bind its listening socket within {timeout:.0f}s")
+        ready.result()
+        logger.info(
+            "[App] WebChannel listening: ws://%s:%s%s",
+            channel.config.host,
+            channel.config.port,
+            channel.config.path,
+        )
+    finally:
+        ready.cancel()
+        await asyncio.gather(ready, return_exceptions=True)
+
+
+async def _stop_web_runtime(
+    web_channel: Any,
+    web_task: asyncio.Task[None] | None,
+) -> None:
+    """Stop the Web channel before its long-running start task exits.
+
+    Stopping the channel can make a still-starting task fail with its own
+    ``RuntimeError``. That error must not replace a primary startup failure such
+    as a readiness timeout originating in the caller, so only cancel a task that
+    is still running and consume the result without re-raising it.
+    """
+    try:
+        if web_channel is not None:
+            await web_channel.stop()
+    finally:
+        if web_task is not None:
+            if not web_task.done():
+                web_task.cancel()
+            await asyncio.gather(web_task, return_exceptions=True)
 
 
 def _running_under_supervisor() -> bool:
@@ -863,7 +837,7 @@ class GatewayServer(BaseWebChannel):
         super().__init__(config, router)
         self.config = config
         self.bus = router
-        self._server = None
+        self._listener = None
         self._running = False
         self._on_message_cb = None
         self._clients: set[Any] = set()
@@ -1523,9 +1497,9 @@ class GatewayServer(BaseWebChannel):
 
     async def wait_until_closed(self) -> None:
         """阻塞至底层 WebSocket 服务完全关闭（与 :meth:`start` 配对供主循环持有任务）。"""
-        if self._server is None:
+        if self._listener is None:
             return
-        await self._server.wait_closed()
+        await self._listener.wait_closed()
 
     def register_local_handler(self, path: str, method: str, handler: Callable[..., Awaitable[None]]) -> None:
         """为指定路径注册本地方法 handler。"""
@@ -1577,22 +1551,16 @@ class GatewayServer(BaseWebChannel):
     async def start(self) -> None:
         if self._running or not self.config.enabled:
             return
-        try:
-            from websockets.legacy.server import serve as ws_serve
-        except Exception:  # pragma: no cover
-            from websockets import serve as ws_serve
+        from agent_gateway.transport.websocket_listener import WebSocketListener
 
-        ws_max_size = 8 * 2**20  # 8 MB — matches AgentServer link
-
-        self._server = await ws_serve(
+        listener = WebSocketListener(
             self._connection_handler,
-            self.config.host,
-            self.config.port,
+            host=self.config.host,
+            port=self.config.port,
             process_request=self._process_request,
-            ping_interval=20,
-            ping_timeout=600,
-            max_size=ws_max_size,
         )
+        self._listener = listener
+        await listener.start()
         self._running = True
         paths = ", ".join(self.config.routes.keys())
         logger.info(
@@ -1617,10 +1585,8 @@ class GatewayServer(BaseWebChannel):
         for task in self._session_bind_tasks:
             task.cancel()
         await asyncio.gather(*self._session_bind_tasks, return_exceptions=True)
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
+        if self._listener is not None:
+            await self._listener.stop()
         # Connection handlers finish their teardown while the server closes.
         self._detached_tui_sessions.clear()
         logger.info("[App] Gateway server stopped")
@@ -2453,6 +2419,15 @@ async def _run(
         config={},
         logger=logger,
     )
+    from agent_gateway.agent_client_mode import (
+        ROUTER_CLIENT_TYPES,
+        read_agent_client_mode,
+        resolve_agent_server_client,
+        validate_agent_client_configuration,
+    )
+
+    agent_client_mode = read_agent_client_mode()
+    validate_agent_client_configuration(get_config() or {}, mode=agent_client_mode)
     extension_manager = ExtensionManager(registry=extension_registry)
     log_startup_stage("extension_manager_created")
     await extension_manager.load_all_extensions()
@@ -2500,11 +2475,15 @@ async def _run(
     if using_adx_router:
         if agent_server_ext is None or agent_server_ext.metadata.id != "adx_router":
             raise RuntimeError("Selected adx_router extension failed to load; check gateway.adx configuration")
+    client = resolve_agent_server_client(
+        agent_server_ext,
+        mode=agent_client_mode,
+        websocket_factory=lambda: WebSocketAgentServerClient(
+            ping_interval=20.0, ping_timeout=600.0,
+        ),
+    )
     if agent_server_ext is not None:
         logger.info("[App] using extension AgentServerClient: %s", agent_server_ext.metadata.name)
-        client = agent_server_ext.get_client()
-    else:
-        client = WebSocketAgentServerClient(ping_interval=20.0, ping_timeout=600.0)
 
     from agent_gateway.routing.third_agent import get_unsupported_third_agent
 
@@ -3016,14 +2995,51 @@ async def _run(
             forward_methods: set[str] | frozenset[str],
             no_local_methods: set[str] | frozenset[str],
             source_label: str,
+            local_methods: AbstractSet[str] | None = None,
     ):
-        return _make_inbound_forwarder(channel_manager, forward_methods, no_local_methods, source_label)
+        async def _norm_and_forward(msg: Message) -> bool:
+            req_method = getattr(msg, "req_method", None)
+            if req_method is None:
+                # 无法解析的方法不能进入 _normalize_gateway_message（那里会回退
+                # 成 CHAT_SEND），交给本地查找返回 METHOD_NOT_FOUND。
+                return False
+            method_val = getattr(req_method, "value", None) or ""
+            route = route_req_method(
+                method_val,
+                forward_methods=forward_methods,
+                local_methods=local_methods,
+            )
+            if route in (ROUTE_LOCAL, ROUTE_DENIED):
+                # 本地方法不转发；命中拒绝前缀时也不外发，交由本地 handler
+                # 查找统一返回 METHOD_NOT_FOUND。
+                return False
+            with trace_stage("preprocess.credentials"):
+                await _refresh_expired_login_credential(msg)
+            normalized = _normalize_gateway_message(msg)
+            # session.create 主路径注入 work_mode 归一化(与 fallback _session_create
+            # 共用同一 helper resolve_session_work_mode_params,保持主路径/fallback 一致):
+            # 成功时写回归一化后的 project_id/project_dir/work_mode 到 params,
+            # 转发到 AgentServer 后由其 session.create 处理逻辑使用;
+            # 失败时(非法 work_mode)不写回,保留原始 params 由 AgentServer 或
+            # fallback _session_create 返回 BAD_REQUEST。
+            if method_val == "session.create":
+                _inject_session_work_mode(normalized)
+            await channel_manager.deliver_to_message_handler(normalized)
+            logger.debug("[App] %s 入站 -> MessageHandler: id=%s channel_id=%s", source_label, msg.id, msg.channel_id)
+            if route == ROUTE_FORWARD_UNKNOWN or method_val in no_local_methods:
+                return True
+            return False
+
+        return _norm_and_forward
 
     homepage_request_dispatched = asyncio.Event()
     web_norm_and_forward = _make_norm_and_forward(
         _FORWARD_REQ_METHODS,
         _FORWARD_NO_LOCAL_HANDLER_METHODS,
         "Web",
+        # 本地 handler 注册表即本地白名单：不在转发表内的已注册方法留在本地，
+        # 其余未知方法默认透传给 AgentServer。视图是实时的，后注册方法同样生效。
+        local_methods=web_channel.registered_methods(),
     )
     channel_manager.register_channel_with_inbound(web_channel, web_norm_and_forward)
 
@@ -3868,7 +3884,7 @@ async def _run(
                 )
                 if not enabled:
                     logger.info("[App] channels.ssh.%s, SshChannel disabled", reason)
-                elif client_type not in {"agentos_router", "adx_router"}:
+                elif client_type not in ROUTER_CLIENT_TYPES:
                     logger.warning(
                         "[App] channels.ssh.enabled=true but gateway.agent_client.type=%s "
                         "(require agentos_router or adx_router); SshChannel will not start",
@@ -4257,14 +4273,7 @@ async def _run(
         await acp_inbound_server.stop()
         if tui_channel is not None:
             await tui_channel.stop()
-        if web_task is not None:
-            web_task.cancel()
-            try:
-                await web_task
-            except asyncio.CancelledError:
-                pass
-        if web_channel is not None:
-            await web_channel.stop()
+        await _stop_web_runtime(web_channel, web_task)
 
         if feishu_channel is not None and feishu_task is not None:
             feishu_task.cancel()
@@ -4401,16 +4410,9 @@ async def _run_with_shutdown_signals(
 ) -> None:
     """Translate process signals into one idempotent Gateway shutdown request."""
 
-    loop = asyncio.get_running_loop()
-    shutdown_event = asyncio.Event()
-    previous_handlers: dict[signal.Signals, Any] = {}
+    from agent_gateway.startup.lifecycle import run_with_shutdown_signals
 
-    def request_shutdown(_signum: int, _frame: Any) -> None:
-        loop.call_soon_threadsafe(shutdown_event.set)
-
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        previous_handlers[signum] = signal.signal(signum, request_shutdown)
-    try:
+    async def run(shutdown_event: asyncio.Event) -> None:
         await _run(
             agent_server_url=agent_server_url,
             web_host=web_host,
@@ -4419,10 +4421,8 @@ async def _run_with_shutdown_signals(
             shutdown_event=shutdown_event,
             web_ws_deflate=web_ws_deflate,
         )
-    finally:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
-        await shutdown_gateway_telemetry()
+
+    await run_with_shutdown_signals(run, shutdown_gateway_telemetry)
 
 
 def main() -> None:
@@ -4518,17 +4518,9 @@ def main() -> None:
     # Per-workspace singleton lock: prevents a second Gateway process from
     # serving the same workspace (two CronSchedulerService instances over one
     # cron_jobs.json => duplicate cron executions).
-    from agent_gateway.gateway_lock import GatewayLock
+    from agent_gateway.startup.lifecycle import gateway_workspace_lock
 
-    gateway_lock = GatewayLock(get_infra_data_dir())
-    if not gateway_lock.acquire():
-        logger.error(
-            "[App] Another Gateway is already serving this workspace; "
-            "refusing duplicate instance (lock: %s)",
-            gateway_lock.lock_path,
-        )
-        raise SystemExit(1)
-    try:
+    with gateway_workspace_lock(get_infra_data_dir()):
         asyncio.run(
             _run_with_shutdown_signals(
                 agent_server_url=agent_server_url,
@@ -4538,8 +4530,6 @@ def main() -> None:
                 web_ws_deflate=web_ws_deflate,
             )
         )
-    finally:
-        gateway_lock.release()
 
 
 if __name__ == "__main__":

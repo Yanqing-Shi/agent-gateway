@@ -63,11 +63,23 @@ async def _assemble_with_allowlist(envelope: E2AEnvelope, api_root: str):
     if not is_enterprise():
         return assemble_rest_request(envelope, base_url=api_root)
     from agent_gateway.enterprise.capabilities.experts.allowlist import bind_outbound_allowlist
-    from agent_gateway.enterprise.config.manager_config.core.application_config.package_allowlist import (
-        read_package_allowlist_packages,
+    from agent_gateway.enterprise.capabilities.experts.bound_packages import packages_for_bot
+    from agent_gateway.extensions.runtime_management_extension.invoke_ids import (
+        routing_triple_from_envelope,
     )
 
-    packages = await read_package_allowlist_packages()
+    _, bot_id, _ = routing_triple_from_envelope(envelope)
+    if not bot_id:
+        # 没有可信 bot 就无法展开模板槽：空名单会让下游拒绝全部受控专家包
+        # （只放行用户自有包）。这不是新的越权面，但排障时必须能看出原因，
+        # 因此显式记录而不是静默按空名单出站。
+        logger.warning(
+            "[RuntimeManagement] outbound allowlist has no trusted bot_id; "
+            "expert packages resolve to empty: method=%s request_id=%s",
+            getattr(envelope, "method", ""),
+            getattr(envelope, "request_id", ""),
+        )
+    packages = await packages_for_bot(bot_id)
     with bind_outbound_allowlist(packages):
         return assemble_rest_request(envelope, base_url=api_root)
 

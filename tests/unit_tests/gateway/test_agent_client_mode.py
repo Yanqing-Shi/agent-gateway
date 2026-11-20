@@ -15,8 +15,12 @@ from agent_gateway.agent_client_mode import (
 )
 
 
-class RuntimeRoutedAgentClient:
-    """只借用这个类名。测试不加载扩展包。"""
+class _RenamedRuntimeClient:
+    agent_client_mode = "runtime"
+
+
+class _RuntimeSubclass(_RenamedRuntimeClient):
+    pass
 
 
 class _OtherClient:
@@ -58,8 +62,9 @@ def test_unset_or_websocket_keeps_the_current_choice() -> None:
     assert created == ["ws", "ws"]
 
 
-def test_runtime_requires_the_runtime_client() -> None:
-    client = RuntimeRoutedAgentClient()
+@pytest.mark.parametrize("client_type", [_RenamedRuntimeClient, _RuntimeSubclass])
+def test_runtime_requires_the_runtime_client(client_type) -> None:
+    client = client_type()
     assert (
         resolve_agent_server_client(
             _Extension(client),
@@ -71,7 +76,7 @@ def test_runtime_requires_the_runtime_client() -> None:
 
 
 def test_runtime_without_the_extension_fails() -> None:
-    with pytest.raises(AgentClientModeError, match="runtime 扩展包"):
+    with pytest.raises(AgentClientModeError, match="未加载.*扩展搜索目录"):
         resolve_agent_server_client(
             None,
             mode="runtime",
@@ -79,13 +84,26 @@ def test_runtime_without_the_extension_fails() -> None:
         )
 
 
+def test_runtime_extension_without_client_fails() -> None:
+    with pytest.raises(AgentClientModeError, match="没有返回客户端"):
+        resolve_agent_server_client(
+            _Extension(None),
+            mode="runtime",
+            websocket_factory=lambda: pytest.fail("缺客户端时不应退回 WebSocket"),
+        )
+
+
 def test_runtime_rejects_a_different_extension_client() -> None:
-    with pytest.raises(AgentClientModeError, match="runtime 扩展包"):
+    """扩展能加载但客户端未声明能力标记时，报错必须指向能力标记/版本，而非搜索目录。"""
+    with pytest.raises(AgentClientModeError, match='agent_client_mode="runtime"') as exc:
         resolve_agent_server_client(
             _Extension(_OtherClient()),
             mode="runtime",
             websocket_factory=lambda: "unused",
         )
+    message = str(exc.value)
+    assert "扩展搜索目录" not in message
+    assert "版本不匹配" in message
 
 
 def test_http_mode_fails() -> None:

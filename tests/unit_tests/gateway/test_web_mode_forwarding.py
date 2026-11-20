@@ -64,13 +64,9 @@ def _isolated_gateway(monkeypatch, tmp_path):
     monkeypatch.setenv("JIUWENSWARM_DATA_DIR", str(tmp_path / ".jiuwenswarm"))
     monkeypatch.setattr(MessageHandler, "_instance", None)
 
-    async def no_refresh(_msg) -> None:
-        return None
-
     async def no_hook(_self, _msg) -> None:
         return None
 
-    monkeypatch.setattr(app_gateway, "_refresh_expired_login_credential", no_refresh)
     monkeypatch.setattr(MessageHandler, "_trigger_before_chat_request_hook", no_hook)
 
 
@@ -94,13 +90,23 @@ async def _flush_writes(channel: WebChannel, *tabs: _ClientSocket) -> None:
             await channel._drain_and_cleanup_writer(tab, ws_id)
 
 
+def _web_forwarder(manager):
+    """The Web inbound callback as _run builds it: the production method lists and normalization."""
+    async def forward(msg) -> bool:
+        method = getattr(getattr(msg, "req_method", None), "value", None) or ""
+        if method not in _FORWARD_REQ_METHODS:
+            return False
+        await manager.deliver_to_message_handler(app_gateway._normalize_gateway_message(msg))
+        return method in _FORWARD_NO_LOCAL_HANDLER_METHODS
+
+    return forward
+
+
 def _recording_web_channel() -> tuple[WebChannel, _RecordingChannelManager]:
-    """The production Web forwarder in front of a manager that only records what reaches it."""
+    """The Web forwarder in front of a manager that only records what reaches it."""
     manager = _RecordingChannelManager()
     channel = WebChannel(WebChannelConfig(enabled=True), RobotMessageRouter())
-    channel.on_message(app_gateway._make_inbound_forwarder(
-        manager, _FORWARD_REQ_METHODS, _FORWARD_NO_LOCAL_HANDLER_METHODS, "Web",
-    ))
+    channel.on_message(_web_forwarder(manager))
     return channel, manager
 
 
@@ -112,7 +118,7 @@ def _connect(channel: WebChannel, port: int, user_id: str = "alice") -> _ClientS
 
 @asynccontextmanager
 async def _gateway_with_agent_server():
-    """The production Web forwarder, MessageHandler and E2A client, with an AgentServer the test answers."""
+    """The Web forwarder, the production MessageHandler and E2A client, and an AgentServer the test answers."""
     client = WebSocketAgentServerClient()
     agent = _AgentServerSocket()
     client._ws = agent
@@ -121,9 +127,7 @@ async def _gateway_with_agent_server():
     manager = ChannelManager(handler, {})
     handler.set_channel_manager(manager)
     channel = WebChannel(WebChannelConfig(enabled=True), RobotMessageRouter())
-    manager.register_channel_with_inbound(channel, app_gateway._make_inbound_forwarder(
-        manager, _FORWARD_REQ_METHODS, _FORWARD_NO_LOCAL_HANDLER_METHODS, "Web",
-    ))
+    manager.register_channel_with_inbound(channel, _web_forwarder(manager))
     await handler.start_forwarding()
     await manager.start_dispatch()
     try:
@@ -145,7 +149,7 @@ def _answer(gateway: SimpleNamespace, env: E2AEnvelope, *, ok: bool, payload: di
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["mode.set", "mode.get"])
 async def test_web_mode_frame_forwards_once_without_local_reply(method: str) -> None:
-    """The production Web forwarder hands the frame to MessageHandler unchanged and the channel stays silent."""
+    """The Web forwarder hands the frame to MessageHandler unchanged and the channel stays silent."""
     channel, manager = _recording_web_channel()
     tab = _connect(channel, 1001)
     params = {"session_id": "saved-session", "mode": "team.work.normal", "expected_mode": "agent.work.normal"}

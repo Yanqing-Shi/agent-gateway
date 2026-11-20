@@ -770,6 +770,18 @@ class AgentOSRouterClient(AgentServerClient):
     def auth_enabled(self) -> bool:
         return self._auth_client is not None
 
+    async def refresh_access_token(self, refresh_token: str) -> str | None:
+        """向 IAM 刷新 access token；供 web proxy 在 token 过期时调用。"""
+        auth_client = self._auth_client
+        refresh = (
+            getattr(auth_client, "refresh_access_token", None)
+            if auth_client is not None
+            else None
+        )
+        if not callable(refresh):
+            return None
+        return await refresh(refresh_token)
+
     @staticmethod
     def _header_user_id(headers: Mapping[str, str]) -> str:
         lowered = {str(k).lower(): str(v or "") for k, v in headers.items()}
@@ -802,10 +814,14 @@ class AgentOSRouterClient(AgentServerClient):
         or ``X-User-Id``), and AgentServer checks Session ownership against it.
         Each source may declare once: a header container and a dict view of it
         pick different values from repeats. Every declared value must be the
-        token's IAM user id or username, the same rule as ``/file-api`` and the
-        web proxy; declaring nothing is allowed. For Web the verified identity is
-        recorded as ``extensions["connection_user_id"]``, so the connection uses
-        exactly the name that was checked instead of reading the request again.
+        token's username; declaring nothing is allowed. The IAM user id is not
+        accepted, unlike on ``/file-api`` and the web proxy: runtimes, workspaces
+        and Session owners are keyed by username, so a connection named by its
+        IAM user id would not reach that user's own Sessions. When IAM names no
+        username there is no name to bind to, so every declaration is refused.
+        For Web the verified identity is recorded as
+        ``extensions["connection_user_id"]``, so the connection uses exactly the
+        name that was checked instead of reading the request again.
         """
         query_values = urllib.parse.parse_qs(urllib.parse.urlparse(path).query).get("user_id", [])
         header_values = self._header_values(headers, "x-user-id")
@@ -815,19 +831,17 @@ class AgentOSRouterClient(AgentServerClient):
             )
         declared_query = query_values[0].strip() if query_values else ""
         declared_header = header_values[0].strip() if header_values else ""
-        identities = {str(result.user_id or "").strip()}
+        username = ""
         if isinstance(result.extensions, dict):
-            identities.add(str(result.extensions.get("username") or "").strip())
-        identities.discard("")
+            username = str(result.extensions.get("username") or "").strip()
         declared = {value for value in (declared_query, declared_header) if value}
-        if not declared <= identities:
+        if not declared <= {username}:
             return self._refuse_declared_user(
                 result, "USER_MISMATCH", "user_id 与 token 不匹配", channel=channel, remote=remote,
                 declared=declared,
             )
         if channel == ChannelType.WEB.value:
-            # WebChannel's own precedence: the query, then the header.
-            result.extensions = {**(result.extensions or {}), "connection_user_id": declared_query or declared_header}
+            result.extensions = {**(result.extensions or {}), "connection_user_id": username if declared else ""}
         return None
 
     @staticmethod

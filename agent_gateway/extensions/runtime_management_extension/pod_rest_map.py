@@ -12,6 +12,9 @@ from urllib.parse import quote, urljoin
 
 from e2a.models import E2AEnvelope
 
+from agent_gateway.common.protocol_methods import TEAM_CONTROL_METHODS
+from agent_gateway.enterprise.edition import is_enterprise
+
 API_PREFIX = "/api/v1"
 DEFAULT_HTTP_PORT = 8766
 
@@ -127,6 +130,15 @@ _ROUTE_ROWS: tuple[tuple[str, str, str], ...] = (
     ("team.history.get", "GET", "/sessions/{session_id}/team/history"),
     ("team.mq.publish", "POST", "/teams/mq/publish"),
     ("team.delete", "DELETE", "/teams/{team_name}"),
+    # 企业团队控制面。路径照抄 e2a 协议表（RUNTIME_HTTP_ROUTES），**不要**用北向
+    # 的 /teams/lookup、/teams/memberships——那是 Gateway 北向接口，打南向会 404。
+    ("team.create", "POST", "/teams"),
+    ("team.get", "GET", "/teams/current"),
+    ("team.stop", "POST", "/teams/actions/stop"),
+    ("team.member.join", "POST", "/teams/members/join"),
+    ("team.member.leave", "POST", "/teams/members/leave"),
+    ("team.members.list", "GET", "/teams/members"),
+    ("team.quota.get", "GET", "/teams/quota"),
     ("skills.list", "GET", "/skills"),
     ("skills.installed", "GET", "/skills/installed"),
     ("skills.marketplace.list", "GET", "/skills/marketplace"),
@@ -301,7 +313,7 @@ _ROUTE_ROWS: tuple[tuple[str, str, str], ...] = (
     ("project.remove", "DELETE", "/projects/{project_id}"),
     # 定时任务创建前问「这个项目现在能不能跑」。长连接里已有同名处理，这里补 HTTP。
     # events/inventory 全目录变体不带 project_id，走 scope-wide /lifecycle
-    # （见 assemble_rest_request 的变体选择与 declared_http_routes 的注册）。
+    # （见 assemble_rest_request 的变体选择，以及 declared_http_routes 的声明）。
     ("project.lifecycle", "POST", "/projects/{project_id}/lifecycle"),
     # Gateway 把 cron 工具结果 / 立即执行 run_id / 任务快照回传 Agent（runtime HTTP）。
     ("cron.command.ack", "POST", "/cron/command-ack"),
@@ -424,12 +436,13 @@ def _attach_package_allowlist_header(headers: dict[str, str]) -> None:
 
 
 def declared_http_routes() -> tuple[tuple[str, str, str], ...]:
-    """返回要注册的 ``(方法名, 动词, 路径)``：REST_ROUTES 即南向 REST 能力声明。
+    """本仓声明的南向网址清单：``(方法名, 动词, 路径)``。
 
-    解耦部署后 Gateway 不 import AgentServer 代码，也不读它的处理函数
-    注册表——远端有没有专用网址以本表声明为准（表对照
-    ``docs/zh/Gateway-AgentServer-HTTP-REST组装.md`` 与 AgentServer HTTP
-    路由保持同步）。同一条网址的别名方法取先声明的规范名（键序即优先级）。
+    **本仓只声明、不注册**——这里是跨仓契约，真正注册 FastAPI 网址的是
+    Agent 侧（``jiuwenswarm/server/agent_http_routes.py`` 读取同名函数）。
+    Gateway 不 import AgentServer 代码，远端有没有专用网址以本表为准
+    （表对照 ``docs/zh/Gateway-AgentServer-HTTP-REST组装.md`` 保持同步）。
+    同一条网址的别名方法取先声明的规范名（键序即优先级）。
     """
     chosen: dict[tuple[str, str], str] = {}
     for method, (verb, path) in REST_ROUTES.items():
@@ -448,6 +461,8 @@ def _lookup_route(method: str, *, is_stream: bool) -> tuple[str, str]:
         return "POST", path
     if method == "history.get" and is_stream:
         return "GET", "/sessions/{session_id}/history/stream"
+    if method in TEAM_CONTROL_METHODS and not is_enterprise():
+        raise HttpMethodNotHandled(f"这个方法还没有 HTTP 处理: {method}")
     found = REST_ROUTES.get(method)
     if found is not None:
         return found[0], found[1]
